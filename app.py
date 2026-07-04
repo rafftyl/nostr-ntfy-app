@@ -21,7 +21,7 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r") as f:
             return json.load(f)
-    return {"pubkey": "", "ntfy_url": "http://umbrel.nvpn:13199/nostr-events"}
+    return {"pubkey": "", "ntfy_url": "http://ntfy_app_1:80/nostr-events"}
 
 def save_config(config):
     os.makedirs(DATA_DIR, exist_ok=True)
