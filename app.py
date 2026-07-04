@@ -1,6 +1,9 @@
 import os
+import sys
 import asyncio
 import json
+import logging
+import traceback
 import requests
 import websockets
 import time
@@ -8,12 +11,26 @@ import bech32
 from aiohttp import web
 from collections import deque
 
+# --- LOGGING SETUP ---
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)-5s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+log = logging.getLogger("nostr-ntfy")
+
+# Silence noisy libraries
+logging.getLogger("websockets").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
+
 # --- GLOBAL CONFIG ---
 DATA_DIR = "/data"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 BOOTSTRAP_RELAYS = ["wss://purplepag.es", "wss://relay.damus.io", "wss://nos.lol"]
 MAX_RELAYS = 25
 processed_events = deque(maxlen=10000)
+event_stats = {"received": 0, "deduped": 0, "sent": 0, "failed": 0}
 
 # Bridge lifecycle: hex_pubkey -> asyncio.Task (the gather for that account's listeners)
 running_accounts: dict[str, asyncio.Task] = {}
@@ -25,16 +42,30 @@ _restart_lock = asyncio.Lock()
 def load_config():
     """Load config, migrating old format if needed."""
     if not os.path.exists(CONFIG_FILE):
+        log.info("No config file found at %s — returning empty config", CONFIG_FILE)
         return {"accounts": []}
 
-    with open(CONFIG_FILE, "r") as f:
-        config = json.load(f)
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+        log.debug("Loaded config from %s: %d account(s), ntfy_base=%s",
+                  CONFIG_FILE, len(config.get("accounts", [])), config.get("ntfy_base_url", "(unset)"))
+    except json.JSONDecodeError as e:
+        log.error("Failed to parse config file %s: %s", CONFIG_FILE, e)
+        return {"accounts": []}
+    except Exception as e:
+        log.error("Failed to read config file %s: %s", CONFIG_FILE, e)
+        return {"accounts": []}
 
     # Migrate old single-pubkey format to new multi-account format
     if "pubkey" in config and "accounts" not in config:
         old_pubkey = config.get("pubkey", "")
         old_ntfy_url = config.get("ntfy_url", "")
         old_raw = config.get("raw_input", old_pubkey)
+
+        log.info("Detected old single-pubkey config format. Migrating...")
+        log.info("  Old pubkey: %s...", old_pubkey[:16] if old_pubkey else "(empty)")
+        log.info("  Old ntfy_url: %s", old_ntfy_url)
 
         if old_pubkey:
             if "/" in old_ntfy_url:
@@ -56,33 +87,45 @@ def load_config():
                 ],
             }
             save_config(config)
-            print("Migrated old config to multi-account format.")
+            log.info("Migration complete: 1 account, base_url=%s, topic=%s", base_url, topic)
         else:
             config = {"accounts": []}
+            log.info("Old config had empty pubkey. Starting fresh.")
 
     if "ntfy_base_url" not in config:
         config["ntfy_base_url"] = "http://ntfy_app_1:80"
+        log.info("No ntfy_base_url in config, defaulting to %s", config["ntfy_base_url"])
 
     return config
 
 
 def save_config(config):
     os.makedirs(DATA_DIR, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f, indent=2)
+        log.debug("Config saved: %d account(s), ntfy_base=%s",
+                  len(config.get("accounts", [])), config.get("ntfy_base_url", "(unset)"))
+    except Exception as e:
+        log.error("Failed to save config to %s: %s", CONFIG_FILE, e)
+        log.error(traceback.format_exc())
 
 
 def convert_npub_to_hex(npub):
     try:
         hrp, data = bech32.bech32_decode(npub)
         if data is None:
+            log.warning("bech32_decode returned None for npub: %s...", npub[:20])
             return ""
         decoded = bech32.convertbits(data, 5, 8, False)
         if decoded is None:
+            log.warning("convertbits returned None for npub: %s...", npub[:20])
             return ""
-        return bytes(decoded).hex()
+        hex_val = bytes(decoded).hex()
+        log.debug("Converted npub %s... -> hex %s...", npub[:16], hex_val[:16])
+        return hex_val
     except Exception as e:
-        print(f"Error decoding npub: {e}")
+        log.error("Error decoding npub '%s...': %s", npub[:20], e)
         return ""
 
 
@@ -93,14 +136,35 @@ def hex_to_npub(hex_pubkey):
         if converted is None:
             return ""
         return bech32.bech32_encode("npub", converted)
-    except Exception:
+    except Exception as e:
+        log.debug("hex_to_npub conversion failed for %s...: %s", hex_pubkey[:16], e)
         return ""
 
 
 def validate_pubkey(hex_pubkey):
-    return len(hex_pubkey) == 64 and all(
-        c in "0123456789abcdef" for c in hex_pubkey.lower()
-    )
+    if len(hex_pubkey) != 64:
+        log.debug("Pubkey validation failed: length is %d, expected 64", len(hex_pubkey))
+        return False
+    if not all(c in "0123456789abcdef" for c in hex_pubkey.lower()):
+        log.debug("Pubkey validation failed: contains non-hex characters")
+        return False
+    return True
+
+
+def _log_environment():
+    """Log useful environment info for debugging."""
+    log.info("=== Nostr-to-ntfy Bridge Starting ===")
+    log.info("Python: %s", sys.version.split()[0])
+    log.info("Data dir: %s", DATA_DIR)
+    log.info("Config file: %s", CONFIG_FILE)
+    log.info("Config exists: %s", os.path.exists(CONFIG_FILE))
+    log.info("Bootstrap relays: %s", ", ".join(BOOTSTRAP_RELAYS))
+    log.info("Max relays per account: %d", MAX_RELAYS)
+    log.info("Event dedup buffer size: %d", processed_events.maxlen)
+    # Log a few common env vars that might matter in Docker/Umbrel
+    for var in ["APP_DATA_DIR", "APP_IP", "DEVICE_DOMAIN_NAME"]:
+        val = os.environ.get(var, "(not set)")
+        log.info("  env %s=%s", var, val)
 
 
 # --- WEB UI ---
@@ -267,6 +331,7 @@ def render_toast_redirect(message, is_error=False):
 
 # --- REQUEST HANDLERS ---
 async def handle_index(request):
+    log.debug("GET / — rendering index page")
     config = load_config()
     return web.Response(text=render_index_page(config), content_type="text/html")
 
@@ -275,10 +340,13 @@ async def handle_add(request):
     data = await request.post()
     raw_pubkey = data.get("npub", "").strip()
     ntfy_topic = data.get("ntfy_topic", "nostr-events").strip()
+    log.info("POST /add — raw_pubkey='%s...', ntfy_topic='%s'", raw_pubkey[:24], ntfy_topic)
 
     if not raw_pubkey:
+        log.warning("POST /add — rejected: empty pubkey")
         return render_toast_redirect("Error: Public key is required.", is_error=True)
     if not ntfy_topic:
+        log.warning("POST /add — rejected: empty ntfy topic")
         return render_toast_redirect("Error: ntfy topic is required.", is_error=True)
 
     if raw_pubkey.startswith("npub1"):
@@ -289,6 +357,7 @@ async def handle_add(request):
         npub = ""
 
     if not validate_pubkey(hex_pubkey):
+        log.warning("POST /add — rejected: invalid pubkey (hex='%s...')", hex_pubkey[:16])
         return render_toast_redirect(
             "Error: Invalid public key. Must be a valid npub or 64-char hex string.",
             is_error=True,
@@ -297,6 +366,7 @@ async def handle_add(request):
     config = load_config()
     for acc in config.get("accounts", []):
         if acc.get("hex_pubkey") == hex_pubkey:
+            log.warning("POST /add — rejected: pubkey %s... already configured", hex_pubkey[:16])
             return render_toast_redirect(
                 "Error: This public key is already configured.", is_error=True
             )
@@ -310,8 +380,9 @@ async def handle_add(request):
     }
     config.setdefault("accounts", []).append(new_account)
     save_config(config)
+    log.info("POST /add — added account hex=%s..., npub=%s, topic=%s",
+             hex_pubkey[:16], npub or "(hex-only)", ntfy_topic)
 
-    # Hot-reload: start just this new account (no restart needed)
     asyncio.create_task(reload_bridge(request.app))
     return render_toast_redirect(f"Added account. Listener starting...")
 
@@ -321,18 +392,21 @@ async def handle_delete(request):
     try:
         index = int(data.get("index", -1))
     except (ValueError, TypeError):
+        log.warning("POST /delete — rejected: invalid index '%s'", data.get("index"))
         return render_toast_redirect("Error: Invalid index.", is_error=True)
 
     config = load_config()
     accounts = config.get("accounts", [])
     if index < 0 or index >= len(accounts):
+        log.warning("POST /delete — rejected: index %d out of range (have %d accounts)", index, len(accounts))
         return render_toast_redirect("Error: Account not found.", is_error=True)
 
     removed = accounts.pop(index)
     removed_name = removed.get("npub") or removed.get("hex_pubkey", "")[:16]
     save_config(config)
+    log.info("POST /delete — removed account #%d: %s (hex=%s...)",
+             index, removed_name, removed.get("hex_pubkey", "")[:16])
 
-    # Hot-reload: stop just this account's listeners
     asyncio.create_task(reload_bridge(request.app))
     return render_toast_redirect(f"Removed {removed_name}. Listener stopped.")
 
@@ -340,8 +414,10 @@ async def handle_delete(request):
 async def handle_settings(request):
     data = await request.post()
     ntfy_base = data.get("ntfy_base_url", "").strip().rstrip("/")
+    log.info("POST /settings — ntfy_base_url='%s'", ntfy_base)
 
     if not ntfy_base:
+        log.warning("POST /settings — rejected: empty ntfy base URL")
         return render_toast_redirect("Error: ntfy base URL is required.", is_error=True)
 
     config = load_config()
@@ -350,9 +426,12 @@ async def handle_settings(request):
     save_config(config)
 
     if old_base != ntfy_base:
+        log.info("POST /settings — ntfy_base_url changed: '%s' -> '%s'. Reloading all listeners.", old_base, ntfy_base)
         asyncio.create_task(reload_bridge(request.app))
         return render_toast_redirect("Settings saved. Reloading all listeners...")
-    return render_toast_redirect("Settings saved.")
+    else:
+        log.info("POST /settings — ntfy_base_url unchanged. No reload needed.")
+        return render_toast_redirect("Settings saved.")
 
 
 # --- NOSTR BRIDGE LOGIC ---
@@ -361,25 +440,34 @@ async def fetch_metadata(pubkey_hex):
     follows = set()
     inbox_relays = set()
     group_ids = set()
+    label = pubkey_hex[:12]
 
-    print(f"  Bootstrapping network topology for {pubkey_hex[:8]}...")
+    log.info("[%s] Discovering relays and groups from %d bootstrap relays...",
+             label, len(BOOTSTRAP_RELAYS))
 
     for relay in BOOTSTRAP_RELAYS:
         try:
+            log.debug("[%s] Querying bootstrap relay: %s", label, relay)
             async with websockets.connect(relay, open_timeout=5, close_timeout=5) as ws:
+                req_id = f"boot-{pubkey_hex[:6]}-{int(time.time())}"
                 req = [
                     "REQ",
-                    f"boot-{pubkey_hex[:6]}-{int(time.time())}",
+                    req_id,
                     {"authors": [pubkey_hex], "kinds": [3, 10002, 10009, 9021]},
                 ]
+                log.debug("[%s] Sending bootstrap REQ %s kinds=[3,10002,10009,9021]", label, req_id)
                 await ws.send(json.dumps(req))
+
+                event_count = 0
                 while True:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=5)
                         data = json.loads(msg)
                         if data[0] == "EOSE":
+                            log.debug("[%s] Bootstrap EOSE from %s (got %d events)", label, relay, event_count)
                             break
                         if data[0] == "EVENT":
+                            event_count += 1
                             kind = data[2]["kind"]
                             tags = data[2].get("tags", [])
                             if kind == 3:
@@ -391,67 +479,136 @@ async def fetch_metadata(pubkey_hex):
                                     if t[0] == "r" and len(t) > 1:
                                         if len(t) == 2 or (len(t) > 2 and t[2] == "read"):
                                             inbox_relays.add(t[1])
+                                            log.debug("[%s]   + relay: %s", label, t[1])
                             elif kind in [10009, 9021]:
                                 for t in tags:
                                     if t[0] == "h" and len(t) > 1:
                                         group_ids.add(t[1])
+                                        log.debug("[%s]   + group: %s (kind %d)", label, t[1][:16], kind)
                     except asyncio.TimeoutError:
+                        log.debug("[%s] Bootstrap timeout from %s after %d events", label, relay, event_count)
                         break
+        except asyncio.TimeoutError:
+            log.warning("[%s] Bootstrap relay %s — connection timeout", label, relay)
+        except ConnectionRefusedError:
+            log.warning("[%s] Bootstrap relay %s — connection refused", label, relay)
+        except OSError as e:
+            log.warning("[%s] Bootstrap relay %s — OS error: %s", label, relay, e)
         except Exception as e:
-            print(f"  Bootstrap relay {relay} failed: {e}")
+            log.warning("[%s] Bootstrap relay %s — unexpected error: %s", label, relay, e)
+            log.debug(traceback.format_exc())
             continue
 
-    relays = list(inbox_relays.union(set(BOOTSTRAP_RELAYS)))[:MAX_RELAYS]
-    print(f"  Found {len(relays)} relays, {len(group_ids)} groups, {len(follows)} follows.")
+    all_relays = inbox_relays.union(set(BOOTSTRAP_RELAYS))
+    relays = list(all_relays)[:MAX_RELAYS]
+
+    log.info("[%s] Discovery complete:", label)
+    log.info("[%s]   Relays:  %d total (%d from NIP-65 + %d bootstrap), using %d (capped at %d)",
+             label, len(all_relays), len(inbox_relays), len(BOOTSTRAP_RELAYS), len(relays), MAX_RELAYS)
+    log.info("[%s]   Groups:  %d NIP-29 group IDs (kinds 10009/9021)", label, len(group_ids))
+    log.info("[%s]   Follows: %d (kind 3)", label, len(follows))
+
+    if not relays:
+        log.warning("[%s] No relays discovered! This account will not receive any events.", label)
+
     return relays, list(group_ids)
 
 
 async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_label):
     """Listen on a single relay. Exits cleanly on CancelledError."""
+    reconnect_delay = 30
+    attempt = 0
+    label = account_label
+
     try:
         while True:
+            attempt += 1
             try:
+                log.info("[%s] Relay %s — connecting (attempt %d)...", label, relay_url, attempt)
+                t0 = time.monotonic()
                 async with websockets.connect(
                     relay_url, open_timeout=10, close_timeout=10
                 ) as ws:
-                    print(f"  [{account_label}] Connected to {relay_url}")
+                    connect_ms = int((time.monotonic() - t0) * 1000)
+                    log.info("[%s] Relay %s — connected in %dms", label, relay_url, connect_ms)
+                    attempt = 0  # reset on successful connect
 
                     current_time = int(time.time())
-                    filters = {"#p": [pubkey_hex], "since": current_time, "limit": 0}
                     sub_id = f"listen-{pubkey_hex[:6]}-{relay_url[-8:]}"
-                    await ws.send(json.dumps(["REQ", sub_id, filters]))
+                    filters = {"#p": [pubkey_hex], "since": current_time, "limit": 0}
+                    sub_msg = ["REQ", sub_id, filters]
+                    log.info("[%s] Relay %s — subscribing with id=%s filter=#p[%s...], since=%d",
+                             label, relay_url, sub_id, pubkey_hex[:8], current_time)
+                    await ws.send(json.dumps(sub_msg))
 
                     if group_ids:
                         group_sub_id = f"groups-{pubkey_hex[:6]}-{relay_url[-8:]}"
-                        await ws.send(json.dumps([
+                        group_msg = [
                             "REQ", group_sub_id,
                             {"#h": group_ids, "since": current_time, "limit": 0},
-                        ]))
+                        ]
+                        log.info("[%s] Relay %s — subscribing to %d groups with id=%s",
+                                 label, relay_url, len(group_ids), group_sub_id)
+                        await ws.send(json.dumps(group_msg))
+
+                    msg_count = 0
+                    last_stats_log = time.monotonic()
 
                     while True:
                         msg = await ws.recv()
-                        data = json.loads(msg)
+                        msg_count += 1
+                        try:
+                            data = json.loads(msg)
+                        except json.JSONDecodeError:
+                            log.warning("[%s] Relay %s — received non-JSON message #%d: %s...",
+                                        label, relay_url, msg_count, str(msg)[:100])
+                            continue
 
-                        if data[0] == "EOSE":
+                        msg_type = data[0] if isinstance(data, list) and len(data) > 0 else "unknown"
+
+                        if msg_type == "EOSE":
+                            log.debug("[%s] Relay %s — EOSE for sub '%s'",
+                                     label, relay_url, data[1] if len(data) > 1 else "?")
                             continue
-                        if data[0] == "NOTICE":
-                            print(f"  [{account_label}] NOTICE from {relay_url}: {data[1]}")
+
+                        if msg_type == "NOTICE":
+                            log.info("[%s] Relay %s — NOTICE: %s", label, relay_url, data[1])
                             continue
-                        if data[0] == "EVENT":
-                            evt = data[2]
-                            evt_id = evt.get("id", "")
+
+                        if msg_type == "EVENT":
+                            evt = data[2] if len(data) > 2 else {}
+                            evt_id = evt.get("id", "")[:16]
+                            evt_kind = evt.get("kind", "?")
+                            evt_pubkey = evt.get("pubkey", "")[:12]
+                            sub_for = data[1] if len(data) > 1 else "?"
+
                             if evt_id in processed_events:
+                                event_stats["deduped"] += 1
+                                log.debug("[%s] Relay %s — EVENT %s (kind=%s, from=%s) DEDUPED",
+                                         label, relay_url, evt_id, evt_kind, evt_pubkey)
                                 continue
+
                             processed_events.append(evt_id)
+                            event_stats["received"] += 1
 
                             is_group = any(t[0] == "h" for t in evt.get("tags", []))
                             title = "NIP-29 Group Alert" if is_group else "Nostr Mention"
                             author = evt.get("pubkey", "")[:12]
                             content = evt.get("content", "New notification")
+                            content_preview = content[:80].replace("\n", " ")
                             if len(content) > 280:
                                 content = content[:277] + "..."
 
+                            log.info("[%s] EVENT from relay %s:", label, relay_url)
+                            log.info("[%s]   id:      %s (kind=%d, group=%s)", label, evt_id, evt_kind, is_group)
+                            log.info("[%s]   author:  %s", label, evt_pubkey)
+                            log.info("[%s]   sub:     %s", label, sub_for)
+                            log.info("[%s]   content: %s%s", label, content_preview,
+                                     "..." if len(evt.get("content", "")) > 80 else "")
+                            log.info("[%s]   -> sending to ntfy: %s", label, ntfy_url)
+
                             try:
+                                t0 = time.monotonic()
                                 resp = requests.post(
                                     ntfy_url,
                                     data=content.encode("utf-8"),
@@ -462,24 +619,59 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
                                     },
                                     timeout=10,
                                 )
+                                ntfy_ms = int((time.monotonic() - t0) * 1000)
                                 if resp.status_code == 200:
-                                    print(f"  [{account_label}] Notification sent -> {ntfy_url}")
+                                    event_stats["sent"] += 1
+                                    log.info("[%s]   <- ntfy OK (%d, %dms)", label, resp.status_code, ntfy_ms)
                                 else:
-                                    print(f"  [{account_label}] ntfy returned {resp.status_code}")
+                                    event_stats["failed"] += 1
+                                    log.error("[%s]   <- ntfy FAILED: HTTP %d (%dms) — body: %s",
+                                              label, resp.status_code, ntfy_ms, resp.text[:200])
+                            except requests.ConnectionError as e:
+                                event_stats["failed"] += 1
+                                log.error("[%s]   <- ntfy CONNECTION ERROR: %s", label, e)
+                                log.error("[%s]   Is ntfy reachable at %s?", label, ntfy_url)
+                            except requests.Timeout:
+                                event_stats["failed"] += 1
+                                log.error("[%s]   <- ntfy TIMEOUT after 10s", label)
                             except Exception as e:
-                                print(f"  [{account_label}] ntfy error: {e}")
+                                event_stats["failed"] += 1
+                                log.error("[%s]   <- ntfy error: %s", label, e)
+                                log.debug(traceback.format_exc())
+                        else:
+                            log.debug("[%s] Relay %s — unknown message type: %s",
+                                     label, relay_url, msg_type)
+
+                        # Periodic stats log every 60s
+                        now = time.monotonic()
+                        if now - last_stats_log >= 60:
+                            log.info("[%s] Stats for %s: %d msgs received, event buffer: %d/%d",
+                                     label, relay_url, msg_count, len(processed_events),
+                                     processed_events.maxlen)
+                            log.info("[%s] Global stats: received=%d, deduped=%d, sent=%d, failed=%d",
+                                     label, event_stats["received"], event_stats["deduped"],
+                                     event_stats["sent"], event_stats["failed"])
+                            last_stats_log = now
 
             except asyncio.CancelledError:
-                raise  # let the outer handler deal with it
-            except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
-                print(f"  [{account_label}] {relay_url} disconnected: {e}")
+                raise
+            except websockets.InvalidStatusCode as e:
+                log.error("[%s] Relay %s — rejected connection (HTTP %d)", label, relay_url, e.status_code)
+            except (websockets.ConnectionClosed, websockets.ConnectionClosedError) as e:
+                log.warning("[%s] Relay %s — connection closed: code=%s reason='%s'",
+                           label, relay_url, getattr(e, 'rcvd', '?'), getattr(e, 'reason', ''))
+            except ConnectionRefusedError:
+                log.warning("[%s] Relay %s — connection refused", label, relay_url)
+            except OSError as e:
+                log.warning("[%s] Relay %s — OS error: %s", label, relay_url, e)
             except Exception as e:
-                print(f"  [{account_label}] Error on {relay_url}: {e}")
+                log.error("[%s] Relay %s — unexpected error: %s", label, relay_url, e)
+                log.error(traceback.format_exc())
 
-            print(f"  [{account_label}] Reconnecting to {relay_url} in 30s...")
-            await asyncio.sleep(30)
+            log.info("[%s] Relay %s — reconnecting in %ds...", label, relay_url, reconnect_delay)
+            await asyncio.sleep(reconnect_delay)
     except asyncio.CancelledError:
-        print(f"  [{account_label}] Listener for {relay_url} stopped.")
+        log.info("[%s] Relay %s — listener cancelled (account removed or reloading)", label, relay_url)
         return
 
 
@@ -490,7 +682,14 @@ async def start_account_bridge(account, ntfy_base_url):
     ntfy_url = f"{ntfy_base_url.rstrip('/')}/{ntfy_topic}"
     label = account.get("npub") or hex_pubkey[:12]
 
-    print(f"[{label}] Starting bridge -> {ntfy_url}")
+    log.info("=" * 60)
+    log.info("[%s] === ACCOUNT BRIDGE STARTING ===", label)
+    log.info("[%s]   hex pubkey:  %s", label, hex_pubkey)
+    if account.get("npub"):
+        log.info("[%s]   npub:        %s", label, account["npub"])
+    log.info("[%s]   ntfy topic:  %s", label, ntfy_topic)
+    log.info("[%s]   ntfy URL:    %s", label, ntfy_url)
+    log.info("=" * 60)
 
     relays, group_ids = await fetch_metadata(hex_pubkey)
 
@@ -503,29 +702,36 @@ async def start_account_bridge(account, ntfy_base_url):
             break
     save_config(config)
 
-    print(f"[{label}] Listening on {len(relays)} relays, {len(group_ids)} groups")
+    if not relays:
+        log.warning("[%s] No relays found — this account will be idle until config reload.", label)
+        return
+
+    log.info("[%s] Spawning %d relay listener(s)...", label, len(relays))
+    for i, r in enumerate(relays):
+        log.debug("[%s]   [%d/%d] %s", label, i + 1, len(relays), r)
 
     tasks = [
         asyncio.create_task(listen_to_relay(r, group_ids, hex_pubkey, ntfy_url, label))
         for r in relays
     ]
-    # gather returns when all tasks finish (i.e. all get cancelled)
     await asyncio.gather(*tasks, return_exceptions=True)
+    log.info("[%s] All relay listeners exited.", label)
 
 
 async def stop_account(hex_pubkey, label=""):
     """Cancel and wait for an account's bridge task to fully stop."""
     task = running_accounts.pop(hex_pubkey, None)
     if task is None:
+        log.debug("stop_account called for %s... but no running task found", hex_pubkey[:12])
         return
     display = label or hex_pubkey[:12]
-    print(f"[{display}] Stopping listeners...")
+    log.info("[%s] Cancelling all listeners...", display)
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
-    print(f"[{display}] Stopped.")
+    log.info("[%s] All listeners stopped.", display)
 
 
 async def reload_bridge(app):
@@ -536,12 +742,20 @@ async def reload_bridge(app):
         ntfy_base = config.get("ntfy_base_url", "http://ntfy_app_1:80")
 
         wanted = {acc["hex_pubkey"]: acc for acc in accounts}
-        current = set(running_accounts.keys())
+        current_keys = set(running_accounts.keys())
+        wanted_keys = set(wanted.keys())
+        base_changed = ntfy_base != app.get("_last_ntfy_base", "")
 
-        to_stop = current - set(wanted.keys())
-        to_start = set(wanted.keys()) - current
-        # We also restart changed accounts (ntfy_topic may have changed via settings)
-        to_restart = current & set(wanted.keys()) if ntfy_base != app.get("_last_ntfy_base") else set()
+        to_stop = current_keys - wanted_keys
+        to_start = wanted_keys - current_keys
+        to_restart = (current_keys & wanted_keys) if base_changed else set()
+
+        log.info("--- Bridge reload ---")
+        log.info("  Running: %d account(s), Config: %d account(s)", len(current_keys), len(wanted_keys))
+        log.info("  ntfy_base changed: %s", base_changed)
+        log.info("  To stop:    %s", [k[:12] for k in to_stop] or "(none)")
+        log.info("  To start:   %s", [k[:12] for k in to_start] or "(none)")
+        log.info("  To restart: %s", [k[:12] for k in to_restart] or "(none)")
 
         for hex_pk in to_stop | to_restart:
             label = wanted.get(hex_pk, {}).get("npub", hex_pk[:12])
@@ -550,6 +764,7 @@ async def reload_bridge(app):
         for hex_pk in (to_start | to_restart):
             acc = wanted[hex_pk]
             label = acc.get("npub") or hex_pk[:12]
+            log.info("[%s] Starting account bridge...", label)
             task = asyncio.create_task(
                 _run_account_safely(acc, ntfy_base, label)
             )
@@ -558,9 +773,12 @@ async def reload_bridge(app):
         app["_last_ntfy_base"] = ntfy_base
 
         if not running_accounts:
-            print("No accounts active. Waiting for user input via Web UI.")
+            log.info("No accounts active. Waiting for user input via Web UI.")
         else:
-            print(f"Bridge active: {len(running_accounts)} account(s).")
+            log.info("Bridge active: %d account(s).", len(running_accounts))
+            for pk, task in running_accounts.items():
+                log.info("  %s... — %s", pk[:16], "running" if not task.done() else "DONE")
+        log.info("--- Bridge reload complete ---")
 
 
 async def _run_account_safely(account, ntfy_base_url, label):
@@ -568,13 +786,17 @@ async def _run_account_safely(account, ntfy_base_url, label):
     try:
         await start_account_bridge(account, ntfy_base_url)
     except asyncio.CancelledError:
+        log.debug("[%s] Account bridge task cancelled.", label)
         return
     except Exception as e:
-        print(f"[{label}] Account bridge crashed: {e}")
+        log.error("[%s] Account bridge CRASHED: %s", label, e)
+        log.error(traceback.format_exc())
 
 
 async def start_bridge(app):
     """Called once on app startup."""
+    _log_environment()
+    log.info("--- Initial bridge startup ---")
     await reload_bridge(app)
 
 
@@ -590,5 +812,5 @@ if __name__ == "__main__":
     ])
     app.on_startup.append(start_bridge)
 
-    print("Starting Web UI on port 8181...")
+    log.info("Starting aiohttp web server on 0.0.0.0:8181...")
     web.run_app(app, host="0.0.0.0", port=8181, print=None)
