@@ -3,9 +3,11 @@ import sys
 import asyncio
 import json
 import logging
+import re
 import traceback
 import requests
 import websockets
+from websockets.exceptions import InvalidStatus as WebSocketInvalidStatus
 import time
 import bech32
 from aiohttp import web
@@ -42,7 +44,7 @@ _restart_lock = asyncio.Lock()
 def load_config():
     """Load config, migrating old format if needed."""
     if not os.path.exists(CONFIG_FILE):
-        log.info("No config file found at %s — returning empty config", CONFIG_FILE)
+        log.info("No config file found at %s -- returning empty config", CONFIG_FILE)
         return {"accounts": []}
 
     try:
@@ -94,7 +96,8 @@ def load_config():
 
     if "ntfy_base_url" not in config:
         config["ntfy_base_url"] = "http://ntfy_app_1:80"
-        log.info("No ntfy_base_url in config, defaulting to %s", config["ntfy_base_url"])
+        save_config(config)
+        log.info("No ntfy_base_url in config, defaulting to %s and persisting", config["ntfy_base_url"])
 
     return config
 
@@ -161,10 +164,177 @@ def _log_environment():
     log.info("Bootstrap relays: %s", ", ".join(BOOTSTRAP_RELAYS))
     log.info("Max relays per account: %d", MAX_RELAYS)
     log.info("Event dedup buffer size: %d", processed_events.maxlen)
-    # Log a few common env vars that might matter in Docker/Umbrel
     for var in ["APP_DATA_DIR", "APP_IP", "DEVICE_DOMAIN_NAME"]:
         val = os.environ.get(var, "(not set)")
         log.info("  env %s=%s", var, val)
+
+
+# --- NOTIFICATION FORMATTING ---
+# Tag that ntfy uses to display an emoji icon (via the Tags header)
+KIND_TAG_MAP = {
+    "dm":        "envelope",
+    "mention":   "speech_balloon",
+    "reply":     "leftwards_arrow_with_hook",
+    "repost":    "repeat",
+    "reaction":  "heart",
+    "zap":       "zap",
+    "group":     "busts_in_silhouette",
+    "quote":     "left_speech_bubble",
+}
+
+
+def format_notification(evt):
+    """Classify a Nostr event and return (title, body, tag_key) for ntfy.
+
+    tag_key maps to KIND_TAG_MAP for the emoji used in the ntfy Tags header.
+    """
+    kind = evt.get("kind", -1)
+    tags = evt.get("tags", [])
+    content = evt.get("content", "")
+    pub = evt.get("pubkey", "")[:12]
+
+    # --- NIP-04 Encrypted DMs (kind 4) ---
+    if kind == 4:
+        body = "[encrypted DM -- open in your Nostr client]"
+        return ("DM (NIP-04)", body, "dm")
+
+    # --- NIP-17 Private/Gift-Wrapped DMs (kind 1059) ---
+    if kind == 1059:
+        body = "[encrypted DM -- open in your Nostr client]"
+        return ("DM (NIP-17)", body, "dm")
+
+    # --- Zaps (kind 9735) ---
+    if kind == 9735:
+        sats = ""
+        try:
+            zap_req = json.loads(content)
+            bolt11 = ""
+            for t in zap_req.get("tags", []):
+                if t[0] == "bolt11" and len(t) > 1:
+                    bolt11 = t[1]
+            if bolt11:
+                # Extract amount from bolt11 (amount is before 'lnbc')
+                m = re.search(r'lnbc(\d+)([munp])', bolt11)
+                if m:
+                    val = int(m.group(1))
+                    unit = m.group(2)
+                    if unit == 'm':
+                        sats = f"{val * 100_000:,} sats"
+                    elif unit == 'u':
+                        sats = f"{val * 100:,} sats"
+                    elif unit == 'n':
+                        sats = f"{val * 10:,} sats"
+                    elif unit == 'p':
+                        sats = f"{val // 10:,} sats"
+                    else:
+                        sats = f"{val} sats"
+        except Exception:
+            pass
+
+        zap_desc = ""
+        try:
+            zap_req = json.loads(content)
+            zap_content = zap_req.get("content", "")
+            if zap_content:
+                zap_desc = zap_content
+        except Exception:
+            pass
+
+        body = f"{sats}" if sats else ""
+        if zap_desc:
+            body += f" -- {zap_desc[:120]}" if body else zap_desc[:120]
+        if not body:
+            body = f"Zap from {pub}"
+        return ("Zap", body, "zap")
+
+    # --- NIP-29 Group messages (kind 9) ---
+    if kind == 9:
+        group_name = ""
+        for t in tags:
+            if t[0] == "h" and len(t) > 1:
+                group_name = t[1][:12]
+                break
+        preview = content[:160].replace("\n", " ")
+        body = f"{preview}" if preview else f"Message in group {group_name}"
+        return ("NIP-29 Group", body, "group")
+
+    # --- NIP-29 Group management (kinds 9000-9009, 9021) ---
+    if kind in (9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9021):
+        action = {
+            9000: "Join request",
+            9001: "Leave request",
+            9002: "Access grant",
+            9003: "Access revoke",
+            9004: "Member add",
+            9005: "Member remove",
+            9006: "Role add",
+            9007: "Role remove",
+            9008: "Group delete",
+            9009: "Edit metadata",
+            9021: "Group create",
+        }.get(kind, f"Group event (kind {kind})")
+        group_name = ""
+        for t in tags:
+            if t[0] == "h" and len(t) > 1:
+                group_name = t[1][:16]
+                break
+        body = f"{action} in {group_name}" if group_name else action
+        return ("NIP-29 Admin", body, "group")
+
+    # --- NIP-29 Group metadata (kinds 39000-39009) ---
+    if 39000 <= kind <= 39009:
+        meta_kind = {
+            39000: "Group metadata",
+            39001: "Group admins",
+            39002: "Group members",
+            39003: "Group roles",
+        }.get(kind, f"Group meta (kind {kind})")
+        body = f"{meta_kind} updated"
+        return ("NIP-29 Group", body, "group")
+
+    # --- Reactions (kind 7) ---
+    if kind == 7:
+        emoji = content.strip() if content.strip() else "+1"
+        return ("Reaction", f"{emoji} from {pub}", "reaction")
+
+    # --- Reposts (kind 6) ---
+    if kind == 6:
+        return ("Repost", f"Reposted by {pub}", "repost")
+
+    # --- Quote reposts (kind 16) ---
+    if kind == 16:
+        preview = content[:160].replace("\n", " ") if content else f"Quoted by {pub}"
+        return ("Quote", preview, "quote")
+
+    # --- NIP-17 inner chat messages (kind 14) ---
+    if kind == 14:
+        preview = content[:160].replace("\n", " ")
+        return ("DM (NIP-17)", preview, "dm")
+
+    # --- Replies: kind 1 or kind 1111 with 'e' tags ---
+    if kind in (1, 1111):
+        e_tags = [t for t in tags if t[0] == "e"]
+        q_tags = [t for t in tags if t[0] == "q"]
+        has_reply_marker = any(
+            t[0] == "e" and len(t) > 3 and t[3] in ("reply", "root")
+            for t in tags
+        )
+        # If there are 'e' tags with reply/root markers, it's a reply
+        if has_reply_marker:
+            preview = content[:160].replace("\n", " ")
+            kind_label = "kind 1111" if kind == 1111 else "reply"
+            return ("Reply", f"{preview}", "reply")
+        # If there's a 'q' tag, it's a quote
+        if q_tags:
+            preview = content[:160].replace("\n", " ")
+            return ("Quote", preview, "quote")
+        # Otherwise, it's a mention in a post
+        preview = content[:160].replace("\n", " ")
+        return ("Mention", preview, "mention")
+
+    # --- Fallback for any other kind that tags us via #p ---
+    preview = content[:120].replace("\n", " ") if content else f"(kind {kind})"
+    return (f"Nostr (kind {kind})", preview, "mention")
 
 
 # --- WEB UI ---
@@ -253,9 +423,9 @@ def render_index_page(config):
                 is_active = False
 
             status_html = (
-                '<div class="account-status status-active">● Listening</div>'
+                '<div class="account-status status-active">Listening</div>'
                 if is_active
-                else '<div class="account-status status-inactive">○ Stopped</div>'
+                else '<div class="account-status status-inactive">Stopped</div>'
             )
 
             account_html += f"""
@@ -323,15 +493,15 @@ def render_index_page(config):
 def render_toast_redirect(message, is_error=False):
     css_class = "toast-error" if is_error else "toast-success"
     return web.Response(
-        text=f"""<div id="toast" class="toast {css_class}">{message}</div>
-<script>setTimeout(function() {{ window.location = '/'; }}, 1500);</script>""",
+        text=f'<div id="toast" class="toast {css_class}">{message}</div>'
+             '<script>setTimeout(function() { window.location = "/"; }, 1500);</script>',
         content_type="text/html",
     )
 
 
 # --- REQUEST HANDLERS ---
 async def handle_index(request):
-    log.debug("GET / — rendering index page")
+    log.debug("GET / -- rendering index page")
     config = load_config()
     return web.Response(text=render_index_page(config), content_type="text/html")
 
@@ -340,13 +510,13 @@ async def handle_add(request):
     data = await request.post()
     raw_pubkey = data.get("npub", "").strip()
     ntfy_topic = data.get("ntfy_topic", "nostr-events").strip()
-    log.info("POST /add — raw_pubkey='%s...', ntfy_topic='%s'", raw_pubkey[:24], ntfy_topic)
+    log.info("POST /add -- raw_pubkey='%s...', ntfy_topic='%s'", raw_pubkey[:24], ntfy_topic)
 
     if not raw_pubkey:
-        log.warning("POST /add — rejected: empty pubkey")
+        log.warning("POST /add -- rejected: empty pubkey")
         return render_toast_redirect("Error: Public key is required.", is_error=True)
     if not ntfy_topic:
-        log.warning("POST /add — rejected: empty ntfy topic")
+        log.warning("POST /add -- rejected: empty ntfy topic")
         return render_toast_redirect("Error: ntfy topic is required.", is_error=True)
 
     if raw_pubkey.startswith("npub1"):
@@ -357,7 +527,7 @@ async def handle_add(request):
         npub = ""
 
     if not validate_pubkey(hex_pubkey):
-        log.warning("POST /add — rejected: invalid pubkey (hex='%s...')", hex_pubkey[:16])
+        log.warning("POST /add -- rejected: invalid pubkey (hex='%s...')", hex_pubkey[:16])
         return render_toast_redirect(
             "Error: Invalid public key. Must be a valid npub or 64-char hex string.",
             is_error=True,
@@ -366,7 +536,7 @@ async def handle_add(request):
     config = load_config()
     for acc in config.get("accounts", []):
         if acc.get("hex_pubkey") == hex_pubkey:
-            log.warning("POST /add — rejected: pubkey %s... already configured", hex_pubkey[:16])
+            log.warning("POST /add -- rejected: pubkey %s... already configured", hex_pubkey[:16])
             return render_toast_redirect(
                 "Error: This public key is already configured.", is_error=True
             )
@@ -379,12 +549,15 @@ async def handle_add(request):
         "group_count": 0,
     }
     config.setdefault("accounts", []).append(new_account)
+    if "ntfy_base_url" not in config:
+        config["ntfy_base_url"] = "http://ntfy_app_1:80"
+        log.info("Setting default ntfy_base_url in config: %s", config["ntfy_base_url"])
     save_config(config)
-    log.info("POST /add — added account hex=%s..., npub=%s, topic=%s",
+    log.info("POST /add -- added account hex=%s..., npub=%s, topic=%s",
              hex_pubkey[:16], npub or "(hex-only)", ntfy_topic)
 
     asyncio.create_task(reload_bridge(request.app))
-    return render_toast_redirect(f"Added account. Listener starting...")
+    return render_toast_redirect("Added account. Listener starting...")
 
 
 async def handle_delete(request):
@@ -392,19 +565,19 @@ async def handle_delete(request):
     try:
         index = int(data.get("index", -1))
     except (ValueError, TypeError):
-        log.warning("POST /delete — rejected: invalid index '%s'", data.get("index"))
+        log.warning("POST /delete -- rejected: invalid index '%s'", data.get("index"))
         return render_toast_redirect("Error: Invalid index.", is_error=True)
 
     config = load_config()
     accounts = config.get("accounts", [])
     if index < 0 or index >= len(accounts):
-        log.warning("POST /delete — rejected: index %d out of range (have %d accounts)", index, len(accounts))
+        log.warning("POST /delete -- rejected: index %d out of range (have %d accounts)", index, len(accounts))
         return render_toast_redirect("Error: Account not found.", is_error=True)
 
     removed = accounts.pop(index)
     removed_name = removed.get("npub") or removed.get("hex_pubkey", "")[:16]
     save_config(config)
-    log.info("POST /delete — removed account #%d: %s (hex=%s...)",
+    log.info("POST /delete -- removed account #%d: %s (hex=%s...)",
              index, removed_name, removed.get("hex_pubkey", "")[:16])
 
     asyncio.create_task(reload_bridge(request.app))
@@ -414,10 +587,10 @@ async def handle_delete(request):
 async def handle_settings(request):
     data = await request.post()
     ntfy_base = data.get("ntfy_base_url", "").strip().rstrip("/")
-    log.info("POST /settings — ntfy_base_url='%s'", ntfy_base)
+    log.info("POST /settings -- ntfy_base_url='%s'", ntfy_base)
 
     if not ntfy_base:
-        log.warning("POST /settings — rejected: empty ntfy base URL")
+        log.warning("POST /settings -- rejected: empty ntfy base URL")
         return render_toast_redirect("Error: ntfy base URL is required.", is_error=True)
 
     config = load_config()
@@ -426,19 +599,20 @@ async def handle_settings(request):
     save_config(config)
 
     if old_base != ntfy_base:
-        log.info("POST /settings — ntfy_base_url changed: '%s' -> '%s'. Reloading all listeners.", old_base, ntfy_base)
+        log.info("POST /settings -- ntfy_base_url changed: '%s' -> '%s'. Reloading all listeners.", old_base, ntfy_base)
         asyncio.create_task(reload_bridge(request.app))
         return render_toast_redirect("Settings saved. Reloading all listeners...")
     else:
-        log.info("POST /settings — ntfy_base_url unchanged. No reload needed.")
+        log.info("POST /settings -- ntfy_base_url unchanged. No reload needed.")
         return render_toast_redirect("Settings saved.")
 
 
 # --- NOSTR BRIDGE LOGIC ---
 async def fetch_metadata(pubkey_hex):
-    """Discover relays and NIP-29 group IDs for a pubkey."""
+    """Discover relays, NIP-17 inbox relays, and NIP-29 group IDs for a pubkey."""
     follows = set()
-    inbox_relays = set()
+    inbox_relays = set()       # NIP-65 kind=10002
+    nip17_relays = set()       # NIP-17 kind=10050
     group_ids = set()
     label = pubkey_hex[:12]
 
@@ -453,9 +627,9 @@ async def fetch_metadata(pubkey_hex):
                 req = [
                     "REQ",
                     req_id,
-                    {"authors": [pubkey_hex], "kinds": [3, 10002, 10009, 9021]},
+                    {"authors": [pubkey_hex], "kinds": [3, 10002, 10009, 10050, 9021]},
                 ]
-                log.debug("[%s] Sending bootstrap REQ %s kinds=[3,10002,10009,9021]", label, req_id)
+                log.debug("[%s] Sending bootstrap REQ %s kinds=[3,10002,10009,10050,9021]", label, req_id)
                 await ws.send(json.dumps(req))
 
                 event_count = 0
@@ -479,7 +653,12 @@ async def fetch_metadata(pubkey_hex):
                                     if t[0] == "r" and len(t) > 1:
                                         if len(t) == 2 or (len(t) > 2 and t[2] == "read"):
                                             inbox_relays.add(t[1])
-                                            log.debug("[%s]   + relay: %s", label, t[1])
+                                            log.debug("[%s]   + relay (NIP-65): %s", label, t[1])
+                            elif kind == 10050:
+                                for t in tags:
+                                    if t[0] == "r" and len(t) > 1:
+                                        nip17_relays.add(t[1])
+                                        log.debug("[%s]   + relay (NIP-17): %s", label, t[1])
                             elif kind in [10009, 9021]:
                                 for t in tags:
                                     if t[0] == "h" and len(t) > 1:
@@ -489,22 +668,30 @@ async def fetch_metadata(pubkey_hex):
                         log.debug("[%s] Bootstrap timeout from %s after %d events", label, relay, event_count)
                         break
         except asyncio.TimeoutError:
-            log.warning("[%s] Bootstrap relay %s — connection timeout", label, relay)
+            log.warning("[%s] Bootstrap relay %s -- connection timeout", label, relay)
         except ConnectionRefusedError:
-            log.warning("[%s] Bootstrap relay %s — connection refused", label, relay)
+            log.warning("[%s] Bootstrap relay %s -- connection refused", label, relay)
+        except WebSocketInvalidStatus as e:
+            log.warning("[%s] Bootstrap relay %s -- rejected (HTTP %d)", label, relay, e.response.status_code)
         except OSError as e:
-            log.warning("[%s] Bootstrap relay %s — OS error: %s", label, relay, e)
+            log.warning("[%s] Bootstrap relay %s -- OS error: %s", label, relay, e)
         except Exception as e:
-            log.warning("[%s] Bootstrap relay %s — unexpected error: %s", label, relay, e)
+            log.warning("[%s] Bootstrap relay %s -- unexpected error: %s", label, relay, e)
             log.debug(traceback.format_exc())
             continue
 
-    all_relays = inbox_relays.union(set(BOOTSTRAP_RELAYS))
+    # Normalize relay URLs (strip trailing slashes) to avoid duplicates
+    normalized_inbox = {r.rstrip("/") for r in inbox_relays}
+    normalized_nip17 = {r.rstrip("/") for r in nip17_relays}
+    normalized_bootstrap = {r.rstrip("/") for r in BOOTSTRAP_RELAYS}
+    # NIP-65 + bootstrap + NIP-17 inbox relays (NIP-17 relays are critical for DMs)
+    all_relays = normalized_inbox.union(normalized_bootstrap).union(normalized_nip17)
     relays = list(all_relays)[:MAX_RELAYS]
 
     log.info("[%s] Discovery complete:", label)
-    log.info("[%s]   Relays:  %d total (%d from NIP-65 + %d bootstrap), using %d (capped at %d)",
-             label, len(all_relays), len(inbox_relays), len(BOOTSTRAP_RELAYS), len(relays), MAX_RELAYS)
+    log.info("[%s]   Relays:  %d total (%d NIP-65 + %d NIP-17 + %d bootstrap), using %d (capped at %d)",
+             label, len(all_relays), len(normalized_inbox), len(normalized_nip17),
+             len(normalized_bootstrap), len(relays), MAX_RELAYS)
     log.info("[%s]   Groups:  %d NIP-29 group IDs (kinds 10009/9021)", label, len(group_ids))
     log.info("[%s]   Follows: %d (kind 3)", label, len(follows))
 
@@ -524,32 +711,56 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
         while True:
             attempt += 1
             try:
-                log.info("[%s] Relay %s — connecting (attempt %d)...", label, relay_url, attempt)
+                log.info("[%s] Relay %s -- connecting (attempt %d)...", label, relay_url, attempt)
                 t0 = time.monotonic()
                 async with websockets.connect(
                     relay_url, open_timeout=10, close_timeout=10
                 ) as ws:
                     connect_ms = int((time.monotonic() - t0) * 1000)
-                    log.info("[%s] Relay %s — connected in %dms", label, relay_url, connect_ms)
+                    log.info("[%s] Relay %s -- connected in %dms", label, relay_url, connect_ms)
                     attempt = 0  # reset on successful connect
 
                     current_time = int(time.time())
-                    sub_id = f"listen-{pubkey_hex[:6]}-{relay_url[-8:]}"
-                    filters = {"#p": [pubkey_hex], "since": current_time, "limit": 0}
-                    sub_msg = ["REQ", sub_id, filters]
-                    log.info("[%s] Relay %s — subscribing with id=%s filter=#p[%s...], since=%d",
-                             label, relay_url, sub_id, pubkey_hex[:8], current_time)
-                    await ws.send(json.dumps(sub_msg))
+                    suffix = relay_url[-8:].replace("/", "_")
 
+                    # --- Subscription 1: DMs (NIP-04 kind=4, NIP-17 kind=1059) ---
+                    dm_sub_id = f"dm-{pubkey_hex[:6]}-{suffix}"
+                    dm_filter = {"#p": [pubkey_hex], "kinds": [4, 1059], "since": current_time, "limit": 0}
+                    log.info("[%s] Relay %s -- sub %s: DMs (kinds 4,1059)", label, relay_url, dm_sub_id)
+                    await ws.send(json.dumps(["REQ", dm_sub_id, dm_filter]))
+
+                    # --- Subscription 2: Mentions & replies in kind 1 (text notes) ---
+                    mention_sub_id = f"mnt-{pubkey_hex[:6]}-{suffix}"
+                    mention_filter = {"#p": [pubkey_hex], "kinds": [1, 1111], "since": current_time, "limit": 0}
+                    log.info("[%s] Relay %s -- sub %s: mentions/replies (kinds 1,1111)", label, relay_url, mention_sub_id)
+                    await ws.send(json.dumps(["REQ", mention_sub_id, mention_filter]))
+
+                    # --- Subscription 3: Zaps (kind 9735) ---
+                    zap_sub_id = f"zap-{pubkey_hex[:6]}-{suffix}"
+                    zap_filter = {"#p": [pubkey_hex], "kinds": [9735], "since": current_time, "limit": 0}
+                    log.info("[%s] Relay %s -- sub %s: zaps (kind 9735)", label, relay_url, zap_sub_id)
+                    await ws.send(json.dumps(["REQ", zap_sub_id, zap_filter]))
+
+                    # --- Subscription 4: Social (reactions kind=7, reposts kind=6/16) ---
+                    social_sub_id = f"soc-{pubkey_hex[:6]}-{suffix}"
+                    social_filter = {"#p": [pubkey_hex], "kinds": [6, 7, 16], "since": current_time, "limit": 0}
+                    log.info("[%s] Relay %s -- sub %s: social (kinds 6,7,16)", label, relay_url, social_sub_id)
+                    await ws.send(json.dumps(["REQ", social_sub_id, social_filter]))
+
+                    # --- Subscription 5: NIP-29 Group messages (kind 9 + management 9000-9009, 9021) ---
                     if group_ids:
-                        group_sub_id = f"groups-{pubkey_hex[:6]}-{relay_url[-8:]}"
-                        group_msg = [
-                            "REQ", group_sub_id,
-                            {"#h": group_ids, "since": current_time, "limit": 0},
-                        ]
-                        log.info("[%s] Relay %s — subscribing to %d groups with id=%s",
-                                 label, relay_url, len(group_ids), group_sub_id)
-                        await ws.send(json.dumps(group_msg))
+                        group_sub_id = f"grp-{pubkey_hex[:6]}-{suffix}"
+                        group_filter = {
+                            "#h": group_ids,
+                            "kinds": [9, 9000, 9001, 9002, 9003, 9004, 9005,
+                                      9006, 9007, 9008, 9009, 9021,
+                                      39000, 39001, 39002, 39003],
+                            "since": current_time,
+                            "limit": 0,
+                        }
+                        log.info("[%s] Relay %s -- sub %s: NIP-29 groups (%d groups, kinds 9,900x,3900x)",
+                                 label, relay_url, group_sub_id, len(group_ids))
+                        await ws.send(json.dumps(["REQ", group_sub_id, group_filter]))
 
                     msg_count = 0
                     last_stats_log = time.monotonic()
@@ -560,19 +771,19 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
                         try:
                             data = json.loads(msg)
                         except json.JSONDecodeError:
-                            log.warning("[%s] Relay %s — received non-JSON message #%d: %s...",
+                            log.warning("[%s] Relay %s -- received non-JSON message #%d: %s...",
                                         label, relay_url, msg_count, str(msg)[:100])
                             continue
 
                         msg_type = data[0] if isinstance(data, list) and len(data) > 0 else "unknown"
 
                         if msg_type == "EOSE":
-                            log.debug("[%s] Relay %s — EOSE for sub '%s'",
-                                     label, relay_url, data[1] if len(data) > 1 else "?")
+                            log.debug("[%s] Relay %s -- EOSE for sub '%s'",
+                                      label, relay_url, data[1] if len(data) > 1 else "?")
                             continue
 
                         if msg_type == "NOTICE":
-                            log.info("[%s] Relay %s — NOTICE: %s", label, relay_url, data[1])
+                            log.info("[%s] Relay %s -- NOTICE: %s", label, relay_url, data[1])
                             continue
 
                         if msg_type == "EVENT":
@@ -584,38 +795,34 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
 
                             if evt_id in processed_events:
                                 event_stats["deduped"] += 1
-                                log.debug("[%s] Relay %s — EVENT %s (kind=%s, from=%s) DEDUPED",
-                                         label, relay_url, evt_id, evt_kind, evt_pubkey)
+                                log.debug("[%s] Relay %s -- EVENT %s (kind=%s, from=%s, sub=%s) DEDUPED",
+                                          label, relay_url, evt_id, evt_kind, evt_pubkey, sub_for)
                                 continue
 
                             processed_events.append(evt_id)
                             event_stats["received"] += 1
 
-                            is_group = any(t[0] == "h" for t in evt.get("tags", []))
-                            title = "NIP-29 Group Alert" if is_group else "Nostr Mention"
-                            author = evt.get("pubkey", "")[:12]
-                            content = evt.get("content", "New notification")
-                            content_preview = content[:80].replace("\n", " ")
-                            if len(content) > 280:
-                                content = content[:277] + "..."
+                            # Format notification
+                            title, body, tag_key = format_notification(evt)
+                            ntfy_tag = f"nostr,{KIND_TAG_MAP.get(tag_key, 'bell')}"
+                            content_preview = body[:80].replace("\n", " ")
 
-                            log.info("[%s] EVENT from relay %s:", label, relay_url)
-                            log.info("[%s]   id:      %s (kind=%d, group=%s)", label, evt_id, evt_kind, is_group)
-                            log.info("[%s]   author:  %s", label, evt_pubkey)
-                            log.info("[%s]   sub:     %s", label, sub_for)
+                            log.info("[%s] EVENT from relay %s (sub=%s):", label, relay_url, sub_for)
+                            log.info("[%s]   id:      %s (kind=%s, author=%s)", label, evt_id, evt_kind, evt_pubkey)
+                            log.info("[%s]   type:    %s (tag=%s)", label, title, tag_key)
                             log.info("[%s]   content: %s%s", label, content_preview,
-                                     "..." if len(evt.get("content", "")) > 80 else "")
+                                     "..." if len(body) > 80 else "")
                             log.info("[%s]   -> sending to ntfy: %s", label, ntfy_url)
 
                             try:
                                 t0 = time.monotonic()
                                 resp = requests.post(
                                     ntfy_url,
-                                    data=content.encode("utf-8"),
+                                    data=body.encode("utf-8"),
                                     headers={
                                         "Title": title,
-                                        "Tags": f"nostr,{'group' if is_group else 'mention'}",
-                                        "Author": author,
+                                        "Tags": ntfy_tag,
+                                        "Author": evt_pubkey,
                                     },
                                     timeout=10,
                                 )
@@ -625,7 +832,7 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
                                     log.info("[%s]   <- ntfy OK (%d, %dms)", label, resp.status_code, ntfy_ms)
                                 else:
                                     event_stats["failed"] += 1
-                                    log.error("[%s]   <- ntfy FAILED: HTTP %d (%dms) — body: %s",
+                                    log.error("[%s]   <- ntfy FAILED: HTTP %d (%dms) -- body: %s",
                                               label, resp.status_code, ntfy_ms, resp.text[:200])
                             except requests.ConnectionError as e:
                                 event_stats["failed"] += 1
@@ -639,8 +846,8 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
                                 log.error("[%s]   <- ntfy error: %s", label, e)
                                 log.debug(traceback.format_exc())
                         else:
-                            log.debug("[%s] Relay %s — unknown message type: %s",
-                                     label, relay_url, msg_type)
+                            log.debug("[%s] Relay %s -- unknown message type: %s",
+                                      label, relay_url, msg_type)
 
                         # Periodic stats log every 60s
                         now = time.monotonic()
@@ -655,23 +862,23 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
 
             except asyncio.CancelledError:
                 raise
-            except websockets.InvalidStatusCode as e:
-                log.error("[%s] Relay %s — rejected connection (HTTP %d)", label, relay_url, e.status_code)
+            except WebSocketInvalidStatus as e:
+                log.error("[%s] Relay %s -- rejected connection (HTTP %d)", label, relay_url, e.response.status_code)
             except (websockets.ConnectionClosed, websockets.ConnectionClosedError) as e:
-                log.warning("[%s] Relay %s — connection closed: code=%s reason='%s'",
-                           label, relay_url, getattr(e, 'rcvd', '?'), getattr(e, 'reason', ''))
+                log.warning("[%s] Relay %s -- connection closed: code=%s reason='%s'",
+                            label, relay_url, getattr(e, "rcvd", "?"), getattr(e, "reason", ""))
             except ConnectionRefusedError:
-                log.warning("[%s] Relay %s — connection refused", label, relay_url)
+                log.warning("[%s] Relay %s -- connection refused", label, relay_url)
             except OSError as e:
-                log.warning("[%s] Relay %s — OS error: %s", label, relay_url, e)
+                log.warning("[%s] Relay %s -- OS error: %s", label, relay_url, e)
             except Exception as e:
-                log.error("[%s] Relay %s — unexpected error: %s", label, relay_url, e)
+                log.error("[%s] Relay %s -- unexpected error: %s", label, relay_url, e)
                 log.error(traceback.format_exc())
 
-            log.info("[%s] Relay %s — reconnecting in %ds...", label, relay_url, reconnect_delay)
+            log.info("[%s] Relay %s -- reconnecting in %ds...", label, relay_url, reconnect_delay)
             await asyncio.sleep(reconnect_delay)
     except asyncio.CancelledError:
-        log.info("[%s] Relay %s — listener cancelled (account removed or reloading)", label, relay_url)
+        log.info("[%s] Relay %s -- listener cancelled (account removed or reloading)", label, relay_url)
         return
 
 
@@ -703,7 +910,7 @@ async def start_account_bridge(account, ntfy_base_url):
     save_config(config)
 
     if not relays:
-        log.warning("[%s] No relays found — this account will be idle until config reload.", label)
+        log.warning("[%s] No relays found -- this account will be idle until config reload.", label)
         return
 
     log.info("[%s] Spawning %d relay listener(s)...", label, len(relays))
@@ -777,7 +984,7 @@ async def reload_bridge(app):
         else:
             log.info("Bridge active: %d account(s).", len(running_accounts))
             for pk, task in running_accounts.items():
-                log.info("  %s... — %s", pk[:16], "running" if not task.done() else "DONE")
+                log.info("  %s... -- %s", pk[:16], "running" if not task.done() else "DONE")
         log.info("--- Bridge reload complete ---")
 
 
