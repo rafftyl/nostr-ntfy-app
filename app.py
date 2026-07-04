@@ -1,5 +1,4 @@
 import os
-import sys
 import asyncio
 import json
 import requests
@@ -16,8 +15,10 @@ BOOTSTRAP_RELAYS = ["wss://purplepag.es", "wss://relay.damus.io", "wss://nos.lol
 MAX_RELAYS = 25
 processed_events = deque(maxlen=10000)
 
-# Global state: list of running bridge tasks per account
-bridge_tasks: dict[str, asyncio.Task] = {}
+# Bridge lifecycle: hex_pubkey -> asyncio.Task (the gather for that account's listeners)
+running_accounts: dict[str, asyncio.Task] = {}
+# Protect against concurrent restarts
+_restart_lock = asyncio.Lock()
 
 
 # --- UTILITIES ---
@@ -36,7 +37,6 @@ def load_config():
         old_raw = config.get("raw_input", old_pubkey)
 
         if old_pubkey:
-            # Parse old ntfy_url into base + topic
             if "/" in old_ntfy_url:
                 parts = old_ntfy_url.rsplit("/", 1)
                 base_url = parts[0]
@@ -60,7 +60,6 @@ def load_config():
         else:
             config = {"accounts": []}
 
-    # Ensure ntfy_base_url exists
     if "ntfy_base_url" not in config:
         config["ntfy_base_url"] = "http://ntfy_app_1:80"
 
@@ -88,7 +87,6 @@ def convert_npub_to_hex(npub):
 
 
 def hex_to_npub(hex_pubkey):
-    """Best-effort hex-to-npub conversion for display."""
     try:
         data = bytes.fromhex(hex_pubkey)
         converted = bech32.convertbits(data, 8, 5, True)
@@ -100,7 +98,6 @@ def hex_to_npub(hex_pubkey):
 
 
 def validate_pubkey(hex_pubkey):
-    """Check if a hex pubkey is valid (64 hex chars)."""
     return len(hex_pubkey) == 64 and all(
         c in "0123456789abcdef" for c in hex_pubkey.lower()
     )
@@ -119,22 +116,18 @@ STYLE = """
     h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; color: #f9fafb; }
     h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #d1d5db; }
     .subtitle { font-size: 14px; color: #9ca3af; margin-bottom: 24px; }
-
     .card {
         background: #1f2937; padding: 24px; border-radius: 12px;
         border: 1px solid #374151; margin-bottom: 20px;
     }
-
     label { display: block; font-size: 13px; font-weight: 500; color: #9ca3af; margin-bottom: 6px; margin-top: 14px; }
     label:first-child { margin-top: 0; }
-
     input[type="text"] {
         width: 100%; padding: 10px 12px; border: 1px solid #374151; border-radius: 8px;
         background: #111827; color: #f9fafb; font-size: 14px; outline: none; transition: border-color 0.2s;
     }
     input[type="text"]:focus { border-color: #3b82f6; }
     input[type="text"]::placeholder { color: #6b7280; }
-
     .btn {
         display: inline-block; padding: 10px 20px; border: none; border-radius: 8px;
         font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s;
@@ -144,7 +137,6 @@ STYLE = """
     .btn-primary:hover { background-color: #2563eb; }
     .btn-danger { background-color: #dc2626; color: white; padding: 6px 12px; font-size: 12px; }
     .btn-danger:hover { background-color: #b91c1c; }
-
     .account-list { list-style: none; }
     .account-item {
         display: flex; align-items: center; justify-content: space-between;
@@ -155,10 +147,11 @@ STYLE = """
     .account-npub { font-size: 14px; font-weight: 500; color: #f9fafb; word-break: break-all; }
     .account-topic { font-size: 12px; color: #6b7280; margin-top: 4px; }
     .account-relays { font-size: 11px; color: #4b5563; margin-top: 2px; }
+    .account-status { font-size: 11px; margin-top: 4px; }
+    .status-active { color: #34d399; }
+    .status-inactive { color: #f87171; }
     .account-actions { margin-left: 12px; flex-shrink: 0; }
-
     .empty-state { text-align: center; padding: 40px 20px; color: #6b7280; font-size: 14px; }
-
     .toast {
         position: fixed; top: 20px; right: 20px; padding: 12px 20px; border-radius: 8px;
         font-size: 14px; font-weight: 500; z-index: 1000; animation: slideIn 0.3s ease;
@@ -167,13 +160,6 @@ STYLE = """
     .toast-success { background: #065f46; color: #a7f3d0; border: 1px solid #059669; }
     .toast-error { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
     @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
-
-    hr { border: none; border-top: 1px solid #374151; margin: 20px 0; }
-
-    .form-row { display: flex; gap: 10px; align-items: flex-end; }
-    .form-row .field { flex: 1; }
-    .form-row .btn { flex-shrink: 0; margin-top: 0; height: 40px; padding: 10px 16px; width: auto; }
-
     .help { font-size: 12px; color: #6b7280; margin-top: 4px; }
 </style>
 """
@@ -183,17 +169,29 @@ def render_index_page(config):
     accounts = config.get("accounts", [])
     ntfy_base = config.get("ntfy_base_url", "http://ntfy_app_1:80")
 
-    account_html = ""
     if not accounts:
         account_html = '<div class="empty-state">No accounts configured yet. Add your first npub below.</div>'
     else:
+        account_html = ""
         for i, acc in enumerate(accounts):
-            npub_display = acc.get("npub") or acc.get("hex_pubkey", "")[:16] + "..."
+            hex_pk = acc.get("hex_pubkey", "")
+            npub_display = acc.get("npub") or hex_pk[:16] + "..."
             topic = acc.get("ntfy_topic", "nostr-events")
             relays = acc.get("relay_count", 0)
             groups = acc.get("group_count", 0)
-            relay_info = (
-                f"{relays} relays | {groups} groups" if relays else "Will be discovered on save"
+            relay_info = f"{relays} relays | {groups} groups" if relays else "Pending..."
+
+            is_running = hex_pk in running_accounts
+            if is_running:
+                task = running_accounts[hex_pk]
+                is_active = not task.done()
+            else:
+                is_active = False
+
+            status_html = (
+                '<div class="account-status status-active">● Listening</div>'
+                if is_active
+                else '<div class="account-status status-inactive">○ Stopped</div>'
             )
 
             account_html += f"""
@@ -202,6 +200,7 @@ def render_index_page(config):
                     <div class="account-npub">{npub_display}</div>
                     <div class="account-topic">ntfy topic: {ntfy_base}/{topic}</div>
                     <div class="account-relays">{relay_info}</div>
+                    {status_html}
                 </div>
                 <div class="account-actions">
                     <form method="post" action="/delete" style="display:inline;">
@@ -211,7 +210,7 @@ def render_index_page(config):
                 </div>
             </li>"""
 
-    html = f"""<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
@@ -236,11 +235,9 @@ def render_index_page(config):
             <form method="post" action="/add">
                 <label for="npub">Nostr Public Key (npub or hex)</label>
                 <input type="text" id="npub" name="npub" placeholder="npub1..." required>
-
                 <label for="ntfy_topic">ntfy Topic</label>
                 <input type="text" id="ntfy_topic" name="ntfy_topic" value="nostr-events-{len(accounts)}" required>
                 <div class="help">Notifications for this key will be sent to: {ntfy_base}/&lt;topic&gt;</div>
-
                 <button type="submit" class="btn btn-primary">Add Account</button>
             </form>
         </div>
@@ -257,18 +254,13 @@ def render_index_page(config):
     </div>
 </body>
 </html>"""
-    return html
 
 
 def render_toast_redirect(message, is_error=False):
     css_class = "toast-error" if is_error else "toast-success"
     return web.Response(
         text=f"""<div id="toast" class="toast {css_class}">{message}</div>
-<script>
-    setTimeout(function() {{
-        window.location = '/';
-    }}, 1500);
-</script>""",
+<script>setTimeout(function() {{ window.location = '/'; }}, 1500);</script>""",
         content_type="text/html",
     )
 
@@ -286,11 +278,9 @@ async def handle_add(request):
 
     if not raw_pubkey:
         return render_toast_redirect("Error: Public key is required.", is_error=True)
-
     if not ntfy_topic:
         return render_toast_redirect("Error: ntfy topic is required.", is_error=True)
 
-    # Convert npub to hex if needed
     if raw_pubkey.startswith("npub1"):
         hex_pubkey = convert_npub_to_hex(raw_pubkey)
         npub = raw_pubkey
@@ -305,15 +295,12 @@ async def handle_add(request):
         )
 
     config = load_config()
-
-    # Check for duplicates
     for acc in config.get("accounts", []):
         if acc.get("hex_pubkey") == hex_pubkey:
             return render_toast_redirect(
                 "Error: This public key is already configured.", is_error=True
             )
 
-    # Add new account
     new_account = {
         "npub": npub,
         "hex_pubkey": hex_pubkey,
@@ -324,8 +311,9 @@ async def handle_add(request):
     config.setdefault("accounts", []).append(new_account)
     save_config(config)
 
-    asyncio.create_task(delayed_restart())
-    return render_toast_redirect(f"Added account. Bridge restarting...")
+    # Hot-reload: start just this new account (no restart needed)
+    asyncio.create_task(reload_bridge(request.app))
+    return render_toast_redirect(f"Added account. Listener starting...")
 
 
 async def handle_delete(request):
@@ -337,7 +325,6 @@ async def handle_delete(request):
 
     config = load_config()
     accounts = config.get("accounts", [])
-
     if index < 0 or index >= len(accounts):
         return render_toast_redirect("Error: Account not found.", is_error=True)
 
@@ -345,8 +332,9 @@ async def handle_delete(request):
     removed_name = removed.get("npub") or removed.get("hex_pubkey", "")[:16]
     save_config(config)
 
-    asyncio.create_task(delayed_restart())
-    return render_toast_redirect(f"Removed {removed_name}. Bridge restarting...")
+    # Hot-reload: stop just this account's listeners
+    asyncio.create_task(reload_bridge(request.app))
+    return render_toast_redirect(f"Removed {removed_name}. Listener stopped.")
 
 
 async def handle_settings(request):
@@ -357,16 +345,14 @@ async def handle_settings(request):
         return render_toast_redirect("Error: ntfy base URL is required.", is_error=True)
 
     config = load_config()
+    old_base = config.get("ntfy_base_url", "")
     config["ntfy_base_url"] = ntfy_base
     save_config(config)
 
-    asyncio.create_task(delayed_restart())
-    return render_toast_redirect("Settings saved. Bridge restarting...")
-
-
-async def delayed_restart():
-    await asyncio.sleep(1)
-    os._exit(1)
+    if old_base != ntfy_base:
+        asyncio.create_task(reload_bridge(request.app))
+        return render_toast_redirect("Settings saved. Reloading all listeners...")
+    return render_toast_redirect("Settings saved.")
 
 
 # --- NOSTR BRIDGE LOGIC ---
@@ -387,7 +373,6 @@ async def fetch_metadata(pubkey_hex):
                     {"authors": [pubkey_hex], "kinds": [3, 10002, 10009, 9021]},
                 ]
                 await ws.send(json.dumps(req))
-
                 while True:
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -422,111 +407,94 @@ async def fetch_metadata(pubkey_hex):
 
 
 async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_label):
-    """Listen on a single relay for events mentioning pubkey_hex."""
-    while True:
-        try:
-            async with websockets.connect(
-                relay_url, open_timeout=10, close_timeout=10
-            ) as ws:
-                print(f"  [{account_label}] Connected to {relay_url}")
+    """Listen on a single relay. Exits cleanly on CancelledError."""
+    try:
+        while True:
+            try:
+                async with websockets.connect(
+                    relay_url, open_timeout=10, close_timeout=10
+                ) as ws:
+                    print(f"  [{account_label}] Connected to {relay_url}")
 
-                current_time = int(time.time())
-                # Build subscription filter for mentions
-                filters = {"#p": [pubkey_hex], "since": current_time, "limit": 0}
+                    current_time = int(time.time())
+                    filters = {"#p": [pubkey_hex], "since": current_time, "limit": 0}
+                    sub_id = f"listen-{pubkey_hex[:6]}-{relay_url[-8:]}"
+                    await ws.send(json.dumps(["REQ", sub_id, filters]))
 
-                sub_id = f"listen-{pubkey_hex[:6]}-{relay_url[-8:]}"
-                sub_req = ["REQ", sub_id, filters]
-                await ws.send(json.dumps(sub_req))
+                    if group_ids:
+                        group_sub_id = f"groups-{pubkey_hex[:6]}-{relay_url[-8:]}"
+                        await ws.send(json.dumps([
+                            "REQ", group_sub_id,
+                            {"#h": group_ids, "since": current_time, "limit": 0},
+                        ]))
 
-                # If there are group IDs, send a separate subscription
-                if group_ids:
-                    group_sub_id = f"groups-{pubkey_hex[:6]}-{relay_url[-8:]}"
-                    group_req = [
-                        "REQ",
-                        group_sub_id,
-                        {"#h": group_ids, "since": current_time, "limit": 0},
-                    ]
-                    await ws.send(json.dumps(group_req))
+                    while True:
+                        msg = await ws.recv()
+                        data = json.loads(msg)
 
-                while True:
-                    msg = await ws.recv()
-                    data = json.loads(msg)
-
-                    if data[0] == "EOSE":
-                        continue
-
-                    if data[0] == "NOTICE":
-                        print(f"  [{account_label}] NOTICE from {relay_url}: {data[1]}")
-                        continue
-
-                    if data[0] == "EVENT":
-                        evt = data[2]
-                        evt_id = evt.get("id", "")
-
-                        if evt_id in processed_events:
+                        if data[0] == "EOSE":
                             continue
-                        processed_events.append(evt_id)
+                        if data[0] == "NOTICE":
+                            print(f"  [{account_label}] NOTICE from {relay_url}: {data[1]}")
+                            continue
+                        if data[0] == "EVENT":
+                            evt = data[2]
+                            evt_id = evt.get("id", "")
+                            if evt_id in processed_events:
+                                continue
+                            processed_events.append(evt_id)
 
-                        # Determine notification title
-                        is_group = any(
-                            t[0] == "h" for t in evt.get("tags", [])
-                        )
-                        title = "NIP-29 Group Alert" if is_group else "Nostr Mention"
+                            is_group = any(t[0] == "h" for t in evt.get("tags", []))
+                            title = "NIP-29 Group Alert" if is_group else "Nostr Mention"
+                            author = evt.get("pubkey", "")[:12]
+                            content = evt.get("content", "New notification")
+                            if len(content) > 280:
+                                content = content[:277] + "..."
 
-                        # Get author info for the notification
-                        author = evt.get("pubkey", "")[:12]
-                        content = evt.get("content", "New notification")
-                        if len(content) > 280:
-                            content = content[:277] + "..."
-
-                        # Build ntfy message
-                        ntfy_headers = {
-                            "Title": title,
-                            "Tags": f"nostr,{'group' if is_group else 'mention'}",
-                            "Author": author,
-                        }
-
-                        try:
-                            resp = requests.post(
-                                ntfy_url,
-                                data=content.encode("utf-8"),
-                                headers=ntfy_headers,
-                                timeout=10,
-                            )
-                            if resp.status_code == 200:
-                                print(
-                                    f"  [{account_label}] Sent notification via {ntfy_url}"
+                            try:
+                                resp = requests.post(
+                                    ntfy_url,
+                                    data=content.encode("utf-8"),
+                                    headers={
+                                        "Title": title,
+                                        "Tags": f"nostr,{'group' if is_group else 'mention'}",
+                                        "Author": author,
+                                    },
+                                    timeout=10,
                                 )
-                            else:
-                                print(
-                                    f"  [{account_label}] ntfy returned {resp.status_code}"
-                                )
-                        except Exception as e:
-                            print(f"  [{account_label}] Failed to send notification: {e}")
+                                if resp.status_code == 200:
+                                    print(f"  [{account_label}] Notification sent -> {ntfy_url}")
+                                else:
+                                    print(f"  [{account_label}] ntfy returned {resp.status_code}")
+                            except Exception as e:
+                                print(f"  [{account_label}] ntfy error: {e}")
 
-        except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
-            print(f"  [{account_label}] Connection to {relay_url} lost: {e}")
-        except Exception as e:
-            print(f"  [{account_label}] Error on {relay_url}: {e}")
+            except asyncio.CancelledError:
+                raise  # let the outer handler deal with it
+            except (websockets.ConnectionClosed, ConnectionError, OSError) as e:
+                print(f"  [{account_label}] {relay_url} disconnected: {e}")
+            except Exception as e:
+                print(f"  [{account_label}] Error on {relay_url}: {e}")
 
-        print(f"  [{account_label}] Reconnecting to {relay_url} in 30s...")
-        await asyncio.sleep(30)
+            print(f"  [{account_label}] Reconnecting to {relay_url} in 30s...")
+            await asyncio.sleep(30)
+    except asyncio.CancelledError:
+        print(f"  [{account_label}] Listener for {relay_url} stopped.")
+        return
 
 
-async def start_account_bridge(account, ntfy_base_url, app):
-    """Start the full bridge pipeline for a single account."""
+async def start_account_bridge(account, ntfy_base_url):
+    """Run all relay listeners for one account as a gather."""
     hex_pubkey = account["hex_pubkey"]
     ntfy_topic = account.get("ntfy_topic", "nostr-events")
     ntfy_url = f"{ntfy_base_url.rstrip('/')}/{ntfy_topic}"
-    label = account.get("npub", hex_pubkey[:12])
+    label = account.get("npub") or hex_pubkey[:12]
 
     print(f"[{label}] Starting bridge -> {ntfy_url}")
 
     relays, group_ids = await fetch_metadata(hex_pubkey)
 
-    # Update account metadata in config
-    account["relay_count"] = len(relays)
-    account["group_count"] = len(group_ids)
+    # Persist discovered relay/group counts back to config
     config = load_config()
     for acc in config.get("accounts", []):
         if acc["hex_pubkey"] == hex_pubkey:
@@ -535,42 +503,91 @@ async def start_account_bridge(account, ntfy_base_url, app):
             break
     save_config(config)
 
-    print(f"[{label}] Listening on {len(relays)} relays for {len(group_ids)} groups")
+    print(f"[{label}] Listening on {len(relays)} relays, {len(group_ids)} groups")
 
     tasks = [
-        listen_to_relay(r, group_ids, hex_pubkey, ntfy_url, label) for r in relays
+        asyncio.create_task(listen_to_relay(r, group_ids, hex_pubkey, ntfy_url, label))
+        for r in relays
     ]
-    return asyncio.gather(*tasks, return_exceptions=True)
+    # gather returns when all tasks finish (i.e. all get cancelled)
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def stop_account(hex_pubkey, label=""):
+    """Cancel and wait for an account's bridge task to fully stop."""
+    task = running_accounts.pop(hex_pubkey, None)
+    if task is None:
+        return
+    display = label or hex_pubkey[:12]
+    print(f"[{display}] Stopping listeners...")
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    print(f"[{display}] Stopped.")
+
+
+async def reload_bridge(app):
+    """Hot-reload: diff config against running accounts, stop removed, start new."""
+    async with _restart_lock:
+        config = load_config()
+        accounts = config.get("accounts", [])
+        ntfy_base = config.get("ntfy_base_url", "http://ntfy_app_1:80")
+
+        wanted = {acc["hex_pubkey"]: acc for acc in accounts}
+        current = set(running_accounts.keys())
+
+        to_stop = current - set(wanted.keys())
+        to_start = set(wanted.keys()) - current
+        # We also restart changed accounts (ntfy_topic may have changed via settings)
+        to_restart = current & set(wanted.keys()) if ntfy_base != app.get("_last_ntfy_base") else set()
+
+        for hex_pk in to_stop | to_restart:
+            label = wanted.get(hex_pk, {}).get("npub", hex_pk[:12])
+            await stop_account(hex_pk, label)
+
+        for hex_pk in (to_start | to_restart):
+            acc = wanted[hex_pk]
+            label = acc.get("npub") or hex_pk[:12]
+            task = asyncio.create_task(
+                _run_account_safely(acc, ntfy_base, label)
+            )
+            running_accounts[hex_pk] = task
+
+        app["_last_ntfy_base"] = ntfy_base
+
+        if not running_accounts:
+            print("No accounts active. Waiting for user input via Web UI.")
+        else:
+            print(f"Bridge active: {len(running_accounts)} account(s).")
+
+
+async def _run_account_safely(account, ntfy_base_url, label):
+    """Wrapper that logs if an account bridge ever exits unexpectedly."""
+    try:
+        await start_account_bridge(account, ntfy_base_url)
+    except asyncio.CancelledError:
+        return
+    except Exception as e:
+        print(f"[{label}] Account bridge crashed: {e}")
 
 
 async def start_bridge(app):
-    """Main bridge startup: iterate all configured accounts."""
-    config = load_config()
-    accounts = config.get("accounts", [])
-    ntfy_base = config.get("ntfy_base_url", "http://ntfy_app_1:80")
-
-    if not accounts:
-        print("No accounts configured yet. Waiting for user input via Web UI.")
-        return
-
-    print(f"Starting bridge for {len(accounts)} account(s)...")
-    bridge_coros = [
-        start_account_bridge(acc, ntfy_base, app) for acc in accounts
-    ]
-    app["bridge_tasks"] = asyncio.gather(*bridge_coros, return_exceptions=True)
+    """Called once on app startup."""
+    await reload_bridge(app)
 
 
 # --- MAIN APP ENTRY ---
 if __name__ == "__main__":
     app = web.Application()
-    app.add_routes(
-        [
-            web.get("/", handle_index),
-            web.post("/add", handle_add),
-            web.post("/delete", handle_delete),
-            web.post("/settings", handle_settings),
-        ]
-    )
+    app["_last_ntfy_base"] = ""
+    app.add_routes([
+        web.get("/", handle_index),
+        web.post("/add", handle_add),
+        web.post("/delete", handle_delete),
+        web.post("/settings", handle_settings),
+    ])
     app.on_startup.append(start_bridge)
 
     print("Starting Web UI on port 8181...")
