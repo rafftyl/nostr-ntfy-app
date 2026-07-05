@@ -155,6 +155,10 @@ def load_config():
         save_config(config)
         log.info("No ntfy_base_url in config, defaulting to %s and persisting", config["ntfy_base_url"])
 
+    if "ntfy_token" not in config:
+        config["ntfy_token"] = ""
+        save_config(config)
+
     return config
 
 
@@ -458,6 +462,7 @@ STYLE = """
 def render_index_page(config):
     accounts = config.get("accounts", [])
     ntfy_base = config.get("ntfy_base_url", "http://ntfy_app_1:80")
+    ntfy_token = config.get("ntfy_token", "")
 
     if not accounts:
         account_html = '<div class="empty-state">No accounts configured yet. Add your first npub below.</div>'
@@ -538,6 +543,9 @@ def render_index_page(config):
                 <label for="ntfy_base_url">ntfy Base URL</label>
                 <input type="text" id="ntfy_base_url" name="ntfy_base_url" value="{ntfy_base}" required>
                 <div class="help">Base URL of your ntfy server. Topics are appended to this.</div>
+                <label for="ntfy_token">ntfy Access Token</label>
+                <input type="password" id="ntfy_token" name="ntfy_token" value="{ntfy_token}" placeholder="Optional">
+                <div class="help">Bearer token for ntfy authentication (required if your ntfy server has access control enabled).</div>
                 <button type="submit" class="btn btn-primary">Save Settings</button>
             </form>
         </div>
@@ -643,7 +651,8 @@ async def handle_delete(request):
 async def handle_settings(request):
     data = await request.post()
     ntfy_base = data.get("ntfy_base_url", "").strip().rstrip("/")
-    log.info("POST /settings -- ntfy_base_url='%s'", ntfy_base)
+    ntfy_token = data.get("ntfy_token", "").strip()
+    log.info("POST /settings -- ntfy_base_url='%s', ntfy_token=%s", ntfy_base, "***set***" if ntfy_token else "(empty)")
 
     if not ntfy_base:
         log.warning("POST /settings -- rejected: empty ntfy base URL")
@@ -651,15 +660,17 @@ async def handle_settings(request):
 
     config = load_config()
     old_base = config.get("ntfy_base_url", "")
+    old_token = config.get("ntfy_token", "")
     config["ntfy_base_url"] = ntfy_base
+    config["ntfy_token"] = ntfy_token
     save_config(config)
 
-    if old_base != ntfy_base:
-        log.info("POST /settings -- ntfy_base_url changed: '%s' -> '%s'. Reloading all listeners.", old_base, ntfy_base)
+    if old_base != ntfy_base or old_token != ntfy_token:
+        log.info("POST /settings -- settings changed. Reloading all listeners.")
         asyncio.create_task(reload_bridge(request.app))
         return render_toast_redirect("Settings saved. Reloading all listeners...")
     else:
-        log.info("POST /settings -- ntfy_base_url unchanged. No reload needed.")
+        log.info("POST /settings -- settings unchanged. No reload needed.")
         return render_toast_redirect("Settings saved.")
 
 
@@ -771,7 +782,7 @@ async def fetch_metadata(pubkey_hex):
     return relays, list(group_ids)
 
 
-async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_label):
+async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, ntfy_token, account_label):
     """Listen on a single relay. Exits cleanly on CancelledError."""
     reconnect_delay = 30
     attempt = 0
@@ -887,14 +898,17 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
 
                             try:
                                 t0 = time.monotonic()
+                                ntfy_headers = {
+                                    "Title": title,
+                                    "Tags": ntfy_tag,
+                                    "Author": evt_pubkey,
+                                }
+                                if ntfy_token:
+                                    ntfy_headers["Authorization"] = f"Bearer {ntfy_token}"
                                 resp = requests.post(
                                     ntfy_url,
                                     data=body.encode("utf-8"),
-                                    headers={
-                                        "Title": title,
-                                        "Tags": ntfy_tag,
-                                        "Author": evt_pubkey,
-                                    },
+                                    headers=ntfy_headers,
                                     timeout=10,
                                 )
                                 ntfy_ms = int((time.monotonic() - t0) * 1000)
@@ -953,7 +967,7 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
         return
 
 
-async def start_account_bridge(account, ntfy_base_url):
+async def start_account_bridge(account, ntfy_base_url, ntfy_token):
     """Run all relay listeners for one account as a gather."""
     hex_pubkey = account["hex_pubkey"]
     ntfy_topic = account.get("ntfy_topic", "nostr-events")
@@ -967,6 +981,7 @@ async def start_account_bridge(account, ntfy_base_url):
         log.info("[%s]   npub:        %s", label, account["npub"])
     log.info("[%s]   ntfy topic:  %s", label, ntfy_topic)
     log.info("[%s]   ntfy URL:    %s", label, ntfy_url)
+    log.info("[%s]   ntfy token:  %s", label, "***set***" if ntfy_token else "(none)")
     log.info("=" * 60)
 
     relays, group_ids = await fetch_metadata(hex_pubkey)
@@ -989,7 +1004,7 @@ async def start_account_bridge(account, ntfy_base_url):
         log.debug("[%s]   [%d/%d] %s", label, i + 1, len(relays), r)
 
     tasks = [
-        asyncio.create_task(listen_to_relay(r, group_ids, hex_pubkey, ntfy_url, label))
+        asyncio.create_task(listen_to_relay(r, group_ids, hex_pubkey, ntfy_url, ntfy_token, label))
         for r in relays
     ]
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -1018,19 +1033,23 @@ async def reload_bridge(app):
         config = load_config()
         accounts = config.get("accounts", [])
         ntfy_base = config.get("ntfy_base_url", "http://ntfy_app_1:80")
+        ntfy_token = config.get("ntfy_token", "")
 
         wanted = {acc["hex_pubkey"]: acc for acc in accounts}
         current_keys = set(running_accounts.keys())
         wanted_keys = set(wanted.keys())
-        base_changed = ntfy_base != app.get("_last_ntfy_base", "")
+        settings_changed = (
+            ntfy_base != app.get("_last_ntfy_base", "")
+            or ntfy_token != app.get("_last_ntfy_token", "")
+        )
 
         to_stop = current_keys - wanted_keys
         to_start = wanted_keys - current_keys
-        to_restart = (current_keys & wanted_keys) if base_changed else set()
+        to_restart = (current_keys & wanted_keys) if settings_changed else set()
 
         log.info("--- Bridge reload ---")
         log.info("  Running: %d account(s), Config: %d account(s)", len(current_keys), len(wanted_keys))
-        log.info("  ntfy_base changed: %s", base_changed)
+        log.info("  Settings changed: %s", settings_changed)
         log.info("  To stop:    %s", [k[:12] for k in to_stop] or "(none)")
         log.info("  To start:   %s", [k[:12] for k in to_start] or "(none)")
         log.info("  To restart: %s", [k[:12] for k in to_restart] or "(none)")
@@ -1044,11 +1063,12 @@ async def reload_bridge(app):
             label = acc.get("npub") or hex_pk[:12]
             log.info("[%s] Starting account bridge...", label)
             task = asyncio.create_task(
-                _run_account_safely(acc, ntfy_base, label)
+                _run_account_safely(acc, ntfy_base, ntfy_token, label)
             )
             running_accounts[hex_pk] = task
 
         app["_last_ntfy_base"] = ntfy_base
+        app["_last_ntfy_token"] = ntfy_token
 
         if not running_accounts:
             log.info("No accounts active. Waiting for user input via Web UI.")
@@ -1059,10 +1079,10 @@ async def reload_bridge(app):
         log.info("--- Bridge reload complete ---")
 
 
-async def _run_account_safely(account, ntfy_base_url, label):
+async def _run_account_safely(account, ntfy_base_url, ntfy_token, label):
     """Wrapper that logs if an account bridge ever exits unexpectedly."""
     try:
-        await start_account_bridge(account, ntfy_base_url)
+        await start_account_bridge(account, ntfy_base_url, ntfy_token)
     except asyncio.CancelledError:
         log.debug("[%s] Account bridge task cancelled.", label)
         return
