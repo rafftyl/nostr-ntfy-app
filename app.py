@@ -30,14 +30,70 @@ logging.getLogger("aiohttp").setLevel(logging.WARNING)
 DATA_DIR = "/data"
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 BOOTSTRAP_RELAYS = ["wss://purplepag.es", "wss://relay.damus.io", "wss://nos.lol"]
+# Relays known to be DM-friendly (long retention, NIP-17 support).
+# Added to relay set when the user has no kind 10050 inbox relays published,
+# so that NIP-17 gift wraps (kind 1059) sent by other clients can still be found.
+DM_FALLBACK_RELAYS = [
+    "wss://relay.primal.net",
+    "wss://nos.lol",
+    "wss://relay.nostr.band",
+    "wss://relay.damus.io",
+    "wss://nostr.mom",
+    "wss://purplerelay.com",
+]
 MAX_RELAYS = 25
+SEEN_FILE = os.path.join(DATA_DIR, "seen_events.json")
 processed_events = deque(maxlen=10000)
+_seen_dirty = 0  # counter: new events since last disk flush
 event_stats = {"received": 0, "deduped": 0, "sent": 0, "failed": 0}
 
 # Bridge lifecycle: hex_pubkey -> asyncio.Task (the gather for that account's listeners)
 running_accounts: dict[str, asyncio.Task] = {}
 # Protect against concurrent restarts
 _restart_lock = asyncio.Lock()
+
+
+# --- SEEN EVENT PERSISTENCE ---
+def load_seen_events():
+    """Load previously seen event IDs from disk into the dedup deque."""
+    global processed_events
+    if not os.path.exists(SEEN_FILE):
+        log.info("No seen-events file at %s -- starting with empty dedup buffer", SEEN_FILE)
+        return
+    try:
+        with open(SEEN_FILE, "r") as f:
+            ids = json.load(f)
+        if isinstance(ids, list):
+            processed_events = deque(ids, maxlen=10000)
+            log.info("Loaded %d seen event IDs from %s", len(processed_events), SEEN_FILE)
+        else:
+            log.warning("Seen-events file has unexpected format, starting fresh")
+    except Exception as e:
+        log.warning("Failed to load seen-events file: %s -- starting fresh", e)
+
+
+def save_seen_events():
+    """Persist the dedup deque to disk."""
+    global _seen_dirty
+    try:
+        with open(SEEN_FILE, "w") as f:
+            json.dump(list(processed_events), f)
+        _seen_dirty = 0
+        log.debug("Saved %d seen event IDs to %s", len(processed_events), SEEN_FILE)
+    except Exception as e:
+        log.error("Failed to save seen-events file: %s", e)
+
+
+def mark_event_seen(evt_id: str) -> bool:
+    """Record an event ID in the deque; flush to disk periodically. Returns True if new."""
+    global _seen_dirty
+    if evt_id in processed_events:
+        return False  # already seen
+    processed_events.append(evt_id)
+    _seen_dirty += 1
+    if _seen_dirty >= 10:
+        save_seen_events()
+    return True  # new event
 
 
 # --- UTILITIES ---
@@ -684,14 +740,28 @@ async def fetch_metadata(pubkey_hex):
     normalized_inbox = {r.rstrip("/") for r in inbox_relays}
     normalized_nip17 = {r.rstrip("/") for r in nip17_relays}
     normalized_bootstrap = {r.rstrip("/") for r in BOOTSTRAP_RELAYS}
-    # NIP-65 + bootstrap + NIP-17 inbox relays (NIP-17 relays are critical for DMs)
-    all_relays = normalized_inbox.union(normalized_bootstrap).union(normalized_nip17)
+
+    # When no NIP-17 inbox relays (kind 10050) are published, add well-known
+    # DM-capable relays so we can still catch gift wraps (kind 1059) that
+    # senders publish to popular hubs.
+    if not normalized_nip17:
+        normalized_fallback_dm = {r.rstrip("/") for r in DM_FALLBACK_RELAYS}
+        log.info("[%s]   No NIP-17 inbox relays found. Adding %d DM fallback relays: %s",
+                 label, len(normalized_fallback_dm),
+                 ", ".join(sorted(normalized_fallback_dm)))
+    else:
+        normalized_fallback_dm = set()
+
+    # NIP-65 + bootstrap + NIP-17 + DM fallback relays
+    all_relays = normalized_inbox.union(normalized_bootstrap).union(normalized_nip17).union(normalized_fallback_dm)
     relays = list(all_relays)[:MAX_RELAYS]
 
     log.info("[%s] Discovery complete:", label)
-    log.info("[%s]   Relays:  %d total (%d NIP-65 + %d NIP-17 + %d bootstrap), using %d (capped at %d)",
+    log.info("[%s]   Relays:  %d total (%d NIP-65 + %d NIP-17 + %d bootstrap%s), using %d (capped at %d)",
              label, len(all_relays), len(normalized_inbox), len(normalized_nip17),
-             len(normalized_bootstrap), len(relays), MAX_RELAYS)
+             len(normalized_bootstrap),
+             (" + %d DM fallback" % len(normalized_fallback_dm)) if normalized_fallback_dm else "",
+             len(relays), MAX_RELAYS)
     log.info("[%s]   Groups:  %d NIP-29 group IDs (kinds 10009/9021)", label, len(group_ids))
     log.info("[%s]   Follows: %d (kind 3)", label, len(follows))
 
@@ -724,26 +794,29 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
                     suffix = relay_url[-8:].replace("/", "_")
 
                     # --- Subscription 1: DMs (NIP-04 kind=4, NIP-17 kind=1059) ---
+                    # IMPORTANT: No 'since' filter! NIP-59 gift wraps (kind 1059)
+                    # randomize created_at to prevent timing correlation, so
+                    # a since filter would silently drop them.
                     dm_sub_id = f"dm-{pubkey_hex[:6]}-{suffix}"
-                    dm_filter = {"#p": [pubkey_hex], "kinds": [4, 1059], "since": current_time, "limit": 0}
-                    log.info("[%s] Relay %s -- sub %s: DMs (kinds 4,1059)", label, relay_url, dm_sub_id)
+                    dm_filter = {"#p": [pubkey_hex], "kinds": [4, 1059]}
+                    log.info("[%s] Relay %s -- sub %s: DMs (kinds 4,1059) [no since, catching all]", label, relay_url, dm_sub_id)
                     await ws.send(json.dumps(["REQ", dm_sub_id, dm_filter]))
 
                     # --- Subscription 2: Mentions & replies in kind 1 (text notes) ---
                     mention_sub_id = f"mnt-{pubkey_hex[:6]}-{suffix}"
-                    mention_filter = {"#p": [pubkey_hex], "kinds": [1, 1111], "since": current_time, "limit": 0}
+                    mention_filter = {"#p": [pubkey_hex], "kinds": [1, 1111], "since": current_time - 60}
                     log.info("[%s] Relay %s -- sub %s: mentions/replies (kinds 1,1111)", label, relay_url, mention_sub_id)
                     await ws.send(json.dumps(["REQ", mention_sub_id, mention_filter]))
 
                     # --- Subscription 3: Zaps (kind 9735) ---
                     zap_sub_id = f"zap-{pubkey_hex[:6]}-{suffix}"
-                    zap_filter = {"#p": [pubkey_hex], "kinds": [9735], "since": current_time, "limit": 0}
+                    zap_filter = {"#p": [pubkey_hex], "kinds": [9735], "since": current_time - 60}
                     log.info("[%s] Relay %s -- sub %s: zaps (kind 9735)", label, relay_url, zap_sub_id)
                     await ws.send(json.dumps(["REQ", zap_sub_id, zap_filter]))
 
                     # --- Subscription 4: Social (reactions kind=7, reposts kind=6/16) ---
                     social_sub_id = f"soc-{pubkey_hex[:6]}-{suffix}"
-                    social_filter = {"#p": [pubkey_hex], "kinds": [6, 7, 16], "since": current_time, "limit": 0}
+                    social_filter = {"#p": [pubkey_hex], "kinds": [6, 7, 16], "since": current_time - 60}
                     log.info("[%s] Relay %s -- sub %s: social (kinds 6,7,16)", label, relay_url, social_sub_id)
                     await ws.send(json.dumps(["REQ", social_sub_id, social_filter]))
 
@@ -755,8 +828,7 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
                             "kinds": [9, 9000, 9001, 9002, 9003, 9004, 9005,
                                       9006, 9007, 9008, 9009, 9021,
                                       39000, 39001, 39002, 39003],
-                            "since": current_time,
-                            "limit": 0,
+                            "since": current_time - 60,
                         }
                         log.info("[%s] Relay %s -- sub %s: NIP-29 groups (%d groups, kinds 9,900x,3900x)",
                                  label, relay_url, group_sub_id, len(group_ids))
@@ -793,13 +865,12 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, account_la
                             evt_pubkey = evt.get("pubkey", "")[:12]
                             sub_for = data[1] if len(data) > 1 else "?"
 
-                            if evt_id in processed_events:
+                            if not mark_event_seen(evt_id):
                                 event_stats["deduped"] += 1
                                 log.debug("[%s] Relay %s -- EVENT %s (kind=%s, from=%s, sub=%s) DEDUPED",
                                           label, relay_url, evt_id, evt_kind, evt_pubkey, sub_for)
                                 continue
 
-                            processed_events.append(evt_id)
                             event_stats["received"] += 1
 
                             # Format notification
@@ -1003,11 +1074,18 @@ async def _run_account_safely(account, ntfy_base_url, label):
 async def start_bridge(app):
     """Called once on app startup."""
     _log_environment()
+    load_seen_events()
     log.info("--- Initial bridge startup ---")
     await reload_bridge(app)
 
 
 # --- MAIN APP ENTRY ---
+async def stop_bridge(app):
+    """Called on shutdown -- flush seen events to disk."""
+    save_seen_events()
+    log.info("Seen events flushed to disk on shutdown.")
+
+
 if __name__ == "__main__":
     app = web.Application()
     app["_last_ntfy_base"] = ""
@@ -1018,6 +1096,7 @@ if __name__ == "__main__":
         web.post("/settings", handle_settings),
     ])
     app.on_startup.append(start_bridge)
+    app.on_shutdown.append(stop_bridge)
 
     log.info("Starting aiohttp web server on 0.0.0.0:8181...")
     web.run_app(app, host="0.0.0.0", port=8181, print=None)
