@@ -47,6 +47,10 @@ processed_events = deque(maxlen=10000)
 _seen_dirty = 0  # counter: new events since last disk flush
 event_stats = {"received": 0, "deduped": 0, "sent": 0, "failed": 0}
 
+# Author metadata cache: {pubkey_hex: {"nip05": str, "name": str, "ts": float}}
+_AUTHOR_CACHE: dict[str, dict] = {}
+_AUTHOR_CACHE_TTL = 3600  # 1 hour
+
 # Bridge lifecycle: hex_pubkey -> asyncio.Task (the gather for that account's listeners)
 running_accounts: dict[str, asyncio.Task] = {}
 # Protect against concurrent restarts
@@ -94,6 +98,46 @@ def mark_event_seen(evt_id: str) -> bool:
     if _seen_dirty >= 10:
         save_seen_events()
     return True  # new event
+
+
+# --- AUTHOR METADATA RESOLUTION (NIP-05) ---
+async def fetch_author_info(pubkey_hex: str) -> dict:
+    """Fetch author's kind 0 metadata (NIP-05, display name) with caching.
+
+    Returns {"nip05": str|None, "name": str|None}.  Results are cached for
+    _AUTHOR_CACHE_TTL seconds so we don't hammer relays for every event.
+    """
+    cached = _AUTHOR_CACHE.get(pubkey_hex)
+    if cached and (time.time() - cached["ts"]) < _AUTHOR_CACHE_TTL:
+        return cached
+
+    result = {"nip05": None, "name": None, "ts": time.time()}
+
+    for relay in BOOTSTRAP_RELAYS:
+        try:
+            async with websockets.connect(relay, open_timeout=3, close_timeout=3) as ws:
+                req_id = f"meta-{pubkey_hex[:6]}-{int(time.time())}"
+                await ws.send(json.dumps(["REQ", req_id, {"authors": [pubkey_hex], "kinds": [0], "limit": 1}]))
+                try:
+                    while True:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=3)
+                        data = json.loads(msg)
+                        if data[0] == "EOSE":
+                            break
+                        if data[0] == "EVENT":
+                            meta = json.loads(data[2].get("content", "{}"))
+                            result["nip05"] = meta.get("nip05")
+                            result["name"] = meta.get("display_name") or meta.get("name")
+                            break
+                except asyncio.TimeoutError:
+                    pass
+                break  # got a response (or timeout), no need to try other relays
+        except Exception:
+            continue
+
+    _AUTHOR_CACHE[pubkey_hex] = result
+    log.debug("Author cache: %s -> nip05=%s name=%s", pubkey_hex[:12], result["nip05"], result["name"])
+    return result
 
 
 # --- UTILITIES ---
@@ -243,15 +287,18 @@ KIND_TAG_MAP = {
 }
 
 
-def format_notification(evt):
+def format_notification(evt, author_nip05=None, relay_url=None):
     """Classify a Nostr event and return (title, body, tag_key) for ntfy.
 
     tag_key maps to KIND_TAG_MAP for the emoji used in the ntfy Tags header.
+    author_nip05 is the resolved NIP-05 identifier (e.g. bob@example.com).
+    relay_url is the originating relay (used for NIP-29 group context).
     """
     kind = evt.get("kind", -1)
     tags = evt.get("tags", [])
     content = evt.get("content", "")
     pub = evt.get("pubkey", "")[:12]
+    author_display = author_nip05 if author_nip05 else pub
 
     # --- NIP-04 Encrypted DMs (kind 4) ---
     if kind == 4:
@@ -304,19 +351,22 @@ def format_notification(evt):
         if zap_desc:
             body += f" -- {zap_desc[:120]}" if body else zap_desc[:120]
         if not body:
-            body = f"Zap from {pub}"
+            body = f"Zap from {author_display}"
         return ("Zap", body, "zap")
 
     # --- NIP-29 Group messages (kind 9) ---
     if kind == 9:
-        group_name = ""
+        group_id = ""
         for t in tags:
             if t[0] == "h" and len(t) > 1:
-                group_name = t[1][:12]
+                group_id = t[1]
                 break
+        relay_host = relay_url.split("//")[1].split("/")[0].rstrip("/") if relay_url else ""
+        location = f"{relay_host}/{group_id}" if group_id else (relay_host or "unknown")
         preview = content[:160].replace("\n", " ")
-        body = f"{preview}" if preview else f"Message in group {group_name}"
-        return ("NIP-29 Group", body, "group")
+        body = f"{preview}" if preview else f"Message in group {group_id}"
+        body += f"\n[{location}]"
+        return (f"NIP-29: {group_id or 'Group'}", body, "group")
 
     # --- NIP-29 Group management (kinds 9000-9009, 9021) ---
     if kind in (9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9021):
@@ -333,12 +383,15 @@ def format_notification(evt):
             9009: "Edit metadata",
             9021: "Group create",
         }.get(kind, f"Group event (kind {kind})")
-        group_name = ""
+        group_id = ""
         for t in tags:
             if t[0] == "h" and len(t) > 1:
-                group_name = t[1][:16]
+                group_id = t[1]
                 break
-        body = f"{action} in {group_name}" if group_name else action
+        relay_host = relay_url.split("//")[1].split("/")[0].rstrip("/") if relay_url else ""
+        location = f"{relay_host}/{group_id}" if group_id else (relay_host or "unknown")
+        body = f"{action} in {group_id}" if group_id else action
+        body += f"\n[{location}]"
         return ("NIP-29 Admin", body, "group")
 
     # --- NIP-29 Group metadata (kinds 39000-39009) ---
@@ -349,21 +402,24 @@ def format_notification(evt):
             39002: "Group members",
             39003: "Group roles",
         }.get(kind, f"Group meta (kind {kind})")
+        relay_host = relay_url.split("//")[1].split("/")[0].rstrip("/") if relay_url else ""
         body = f"{meta_kind} updated"
+        if relay_host:
+            body += f"\n[{relay_host}]"
         return ("NIP-29 Group", body, "group")
 
     # --- Reactions (kind 7) ---
     if kind == 7:
         emoji = content.strip() if content.strip() else "+1"
-        return ("Reaction", f"{emoji} from {pub}", "reaction")
+        return ("Reaction", f"{emoji} from {author_display}", "reaction")
 
     # --- Reposts (kind 6) ---
     if kind == 6:
-        return ("Repost", f"Reposted by {pub}", "repost")
+        return ("Repost", f"Reposted by {author_display}", "repost")
 
     # --- Quote reposts (kind 16) ---
     if kind == 16:
-        preview = content[:160].replace("\n", " ") if content else f"Quoted by {pub}"
+        preview = content[:160].replace("\n", " ") if content else f"Quoted by {author_display}"
         return ("Quote", preview, "quote")
 
     # --- NIP-17 inner chat messages (kind 14) ---
@@ -916,13 +972,19 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, ntfy_token
 
                             event_stats["received"] += 1
 
+                            # Fetch author metadata (NIP-05) for display enrichment
+                            author_info = await fetch_author_info(evt.get("pubkey", ""))
+                            author_nip05 = author_info.get("nip05")
+
                             # Format notification
-                            title, body, tag_key = format_notification(evt)
+                            title, body, tag_key = format_notification(evt, author_nip05=author_nip05, relay_url=relay_url)
                             ntfy_tag = f"nostr,{KIND_TAG_MAP.get(tag_key, 'bell')}"
                             content_preview = body[:80].replace("\n", " ")
 
                             log.info("[%s] EVENT from relay %s (sub=%s):", label, relay_url, sub_for)
                             log.info("[%s]   id:      %s (kind=%s, author=%s)", label, evt_id, evt_kind, evt_pubkey)
+                            if author_nip05:
+                                log.info("[%s]   author:  %s", label, author_nip05)
                             log.info("[%s]   type:    %s (tag=%s)", label, title, tag_key)
                             log.info("[%s]   content: %s%s", label, content_preview,
                                      "..." if len(body) > 80 else "")
@@ -933,7 +995,7 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, ntfy_token
                                 ntfy_headers = {
                                     "Title": title,
                                     "Tags": ntfy_tag,
-                                    "Author": evt_pubkey,
+                                    "Author": author_nip05 if author_nip05 else evt_pubkey,
                                 }
                                 if ntfy_token:
                                     ntfy_headers["Authorization"] = f"Bearer {ntfy_token}"
