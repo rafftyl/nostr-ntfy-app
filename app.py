@@ -676,11 +676,11 @@ async def handle_settings(request):
 
 # --- NOSTR BRIDGE LOGIC ---
 async def fetch_metadata(pubkey_hex):
-    """Discover relays, NIP-17 inbox relays, and NIP-29 group IDs for a pubkey."""
+    """Discover relays, NIP-17 inbox relays, and NIP-29 group info for a pubkey."""
     follows = set()
     inbox_relays = set()       # NIP-65 kind=10002
     nip17_relays = set()       # NIP-17 kind=10050
-    group_ids = set()
+    group_relays = set()       # NIP-29 kind=10009 relay URLs
     label = pubkey_hex[:12]
 
     log.info("[%s] Discovering relays and groups from %d bootstrap relays...",
@@ -694,9 +694,9 @@ async def fetch_metadata(pubkey_hex):
                 req = [
                     "REQ",
                     req_id,
-                    {"authors": [pubkey_hex], "kinds": [3, 10002, 10009, 10050, 9021]},
+                    {"authors": [pubkey_hex], "kinds": [3, 10002, 10009, 10050]},
                 ]
-                log.debug("[%s] Sending bootstrap REQ %s kinds=[3,10002,10009,10050,9021]", label, req_id)
+                log.debug("[%s] Sending bootstrap REQ %s kinds=[3,10002,10009,10050]", label, req_id)
                 await ws.send(json.dumps(req))
 
                 event_count = 0
@@ -726,11 +726,12 @@ async def fetch_metadata(pubkey_hex):
                                     if t[0] == "r" and len(t) > 1:
                                         nip17_relays.add(t[1])
                                         log.debug("[%s]   + relay (NIP-17): %s", label, t[1])
-                            elif kind in [10009, 9021]:
+                            elif kind == 10009:
+                                # NIP-29 group relay list: r tags = relays hosting your groups
                                 for t in tags:
-                                    if t[0] == "h" and len(t) > 1:
-                                        group_ids.add(t[1])
-                                        log.debug("[%s]   + group: %s (kind %d)", label, t[1][:16], kind)
+                                    if t[0] == "r" and len(t) > 1:
+                                        group_relays.add(t[1])
+                                        log.debug("[%s]   + relay (NIP-29 group): %s", label, t[1])
                     except asyncio.TimeoutError:
                         log.debug("[%s] Bootstrap timeout from %s after %d events", label, relay, event_count)
                         break
@@ -747,10 +748,41 @@ async def fetch_metadata(pubkey_hex):
             log.debug(traceback.format_exc())
             continue
 
+    # --- Discover group IDs from group relays ---
+    # Connect to each group relay and query kind 39002 (group members) events
+    # that include our pubkey. From those, extract group IDs.
+    group_ids = set()
+    if group_relays:
+        log.info("[%s] Querying %d group relay(s) for group membership...", label, len(group_relays))
+        for g_relay in group_relays:
+            try:
+                async with websockets.connect(g_relay, open_timeout=5, close_timeout=5) as ws:
+                    # Query group metadata (kind 39000) and members (kind 39002)
+                    req_id = f"grp-{pubkey_hex[:6]}-{int(time.time())}"
+                    await ws.send(json.dumps(["REQ", req_id, {"kinds": [39002], "#p": [pubkey_hex]}]))
+                    while True:
+                        try:
+                            msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                            data = json.loads(msg)
+                            if data[0] == "EOSE":
+                                break
+                            if data[0] == "EVENT":
+                                # kind 39002 has a 'd' tag with the group ID
+                                for t in data[2].get("tags", []):
+                                    if t[0] == "d" and len(t) > 1:
+                                        group_ids.add(t[1])
+                                        log.info("[%s]   + group member: %s on %s", label, t[1][:16], g_relay)
+                        except asyncio.TimeoutError:
+                            break
+            except Exception as e:
+                log.warning("[%s] Group relay %s -- error querying membership: %s", label, g_relay, e)
+                continue
+
     # Normalize relay URLs (strip trailing slashes) to avoid duplicates
     normalized_inbox = {r.rstrip("/") for r in inbox_relays}
     normalized_nip17 = {r.rstrip("/") for r in nip17_relays}
     normalized_bootstrap = {r.rstrip("/") for r in BOOTSTRAP_RELAYS}
+    normalized_group = {r.rstrip("/") for r in group_relays}
 
     # When no NIP-17 inbox relays (kind 10050) are published, add well-known
     # DM-capable relays so we can still catch gift wraps (kind 1059) that
@@ -763,17 +795,17 @@ async def fetch_metadata(pubkey_hex):
     else:
         normalized_fallback_dm = set()
 
-    # NIP-65 + bootstrap + NIP-17 + DM fallback relays
-    all_relays = normalized_inbox.union(normalized_bootstrap).union(normalized_nip17).union(normalized_fallback_dm)
+    # NIP-65 + bootstrap + NIP-17 + DM fallback + NIP-29 group relays
+    all_relays = normalized_inbox.union(normalized_bootstrap).union(normalized_nip17).union(normalized_fallback_dm).union(normalized_group)
     relays = list(all_relays)[:MAX_RELAYS]
 
     log.info("[%s] Discovery complete:", label)
-    log.info("[%s]   Relays:  %d total (%d NIP-65 + %d NIP-17 + %d bootstrap%s), using %d (capped at %d)",
+    log.info("[%s]   Relays:  %d total (%d NIP-65 + %d NIP-17 + %d bootstrap + %d group%s), using %d (capped at %d)",
              label, len(all_relays), len(normalized_inbox), len(normalized_nip17),
-             len(normalized_bootstrap),
+             len(normalized_bootstrap), len(normalized_group),
              (" + %d DM fallback" % len(normalized_fallback_dm)) if normalized_fallback_dm else "",
              len(relays), MAX_RELAYS)
-    log.info("[%s]   Groups:  %d NIP-29 group IDs (kinds 10009/9021)", label, len(group_ids))
+    log.info("[%s]   Groups:  %d NIP-29 group(s) (from %d group relay(s))", label, len(group_ids), len(group_relays))
     log.info("[%s]   Follows: %d (kind 3)", label, len(follows))
 
     if not relays:
