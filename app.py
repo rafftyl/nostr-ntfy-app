@@ -368,46 +368,6 @@ def format_notification(evt, author_nip05=None, relay_url=None):
         body += f"\n[{location}]"
         return (f"NIP-29: {group_id or 'Group'}", body, "group")
 
-    # --- NIP-29 Group management (kinds 9000-9009, 9021) ---
-    if kind in (9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9021):
-        action = {
-            9000: "Join request",
-            9001: "Leave request",
-            9002: "Access grant",
-            9003: "Access revoke",
-            9004: "Member add",
-            9005: "Member remove",
-            9006: "Role add",
-            9007: "Role remove",
-            9008: "Group delete",
-            9009: "Edit metadata",
-            9021: "Group create",
-        }.get(kind, f"Group event (kind {kind})")
-        group_id = ""
-        for t in tags:
-            if t[0] == "h" and len(t) > 1:
-                group_id = t[1]
-                break
-        relay_host = relay_url.split("//")[1].split("/")[0].rstrip("/") if relay_url else ""
-        location = f"{relay_host}/{group_id}" if group_id else (relay_host or "unknown")
-        body = f"{action} in {group_id}" if group_id else action
-        body += f"\n[{location}]"
-        return ("NIP-29 Admin", body, "group")
-
-    # --- NIP-29 Group metadata (kinds 39000-39009) ---
-    if 39000 <= kind <= 39009:
-        meta_kind = {
-            39000: "Group metadata",
-            39001: "Group admins",
-            39002: "Group members",
-            39003: "Group roles",
-        }.get(kind, f"Group meta (kind {kind})")
-        relay_host = relay_url.split("//")[1].split("/")[0].rstrip("/") if relay_url else ""
-        body = f"{meta_kind} updated"
-        if relay_host:
-            body += f"\n[{relay_host}]"
-        return ("NIP-29 Group", body, "group")
-
     # --- Reactions (kind 7) ---
     if kind == 7:
         emoji = content.strip() if content.strip() else "+1"
@@ -919,17 +879,15 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, ntfy_token
                     log.info("[%s] Relay %s -- sub %s: social (kinds 6,7,16)", label, relay_url, social_sub_id)
                     await ws.send(json.dumps(["REQ", social_sub_id, social_filter]))
 
-                    # --- Subscription 5: NIP-29 Group messages (kind 9 + management 9000-9009, 9021) ---
+                    # --- Subscription 5: NIP-29 Group messages (kind 9 only) ---
                     if group_ids:
                         group_sub_id = f"grp-{pubkey_hex[:6]}-{suffix}"
                         group_filter = {
                             "#h": group_ids,
-                            "kinds": [9, 9000, 9001, 9002, 9003, 9004, 9005,
-                                      9006, 9007, 9008, 9009, 9021,
-                                      39000, 39001, 39002, 39003],
+                            "kinds": [9],
                             "since": current_time - 60,
                         }
-                        log.info("[%s] Relay %s -- sub %s: NIP-29 groups (%d groups, kinds 9,900x,3900x)",
+                        log.info("[%s] Relay %s -- sub %s: NIP-29 group messages (%d groups, kind 9)",
                                  label, relay_url, group_sub_id, len(group_ids))
                         await ws.send(json.dumps(["REQ", group_sub_id, group_filter]))
 
