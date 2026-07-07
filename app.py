@@ -791,8 +791,8 @@ async def fetch_metadata(pubkey_hex):
                             if data[0] == "EVENT":
                                 # kind 39002 has a 'd' tag with the group ID
                                 for t in data[2].get("tags", []):
-                                    if t[0] == "d" and len(t) > 1:
-                                        group_ids.add(t[1])
+                                    if t[0] == "d" and len(t) > 1 and t[1].strip() and t[1].strip() != "_":
+                                        group_ids.add(t[1].strip())
                                         log.info("[%s]   + group member: %s on %s", label, t[1][:16], g_relay)
                         except asyncio.TimeoutError:
                             break
@@ -888,7 +888,7 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, ntfy_token
                     # --- Subscription 5: NIP-29 Group messages (kind 9 only) ---
                     # Always subscribe: group_ids for specific groups + "_" for relay-wide chat
                     group_sub_id = f"grp-{pubkey_hex[:6]}-{suffix}"
-                    h_filter = list(set(group_ids + ["_"]))
+                    h_filter = list(set(group_ids) | {"_"})
                     group_filter = {
                         "#h": h_filter,
                         "kinds": [9],
