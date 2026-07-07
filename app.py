@@ -358,15 +358,21 @@ def format_notification(evt, author_nip05=None, relay_url=None):
     if kind == 9:
         group_id = ""
         for t in tags:
-            if t[0] == "h" and len(t) > 1:
-                group_id = t[1]
+            if t[0] == "h" and len(t) > 1 and t[1].strip():
+                group_id = t[1].strip()
                 break
         relay_host = relay_url.split("//")[1].split("/")[0].rstrip("/") if relay_url else ""
-        location = f"{relay_host}/{group_id}" if group_id else (relay_host or "unknown")
+        is_relay_wide = not group_id or group_id == "_"
         preview = content[:160].replace("\n", " ")
-        body = f"{preview}" if preview else f"Message in group {group_id}"
-        body += f"\n[{location}]"
-        return (f"NIP-29: {group_id or 'Group'}", body, "group")
+        if is_relay_wide:
+            body = preview if preview else "Message on relay-wide chat"
+            body += f"\n[{relay_host}]" if relay_host else ""
+            return ("NIP-29 Relay Chat", body, "group")
+        else:
+            location = f"{relay_host}/{group_id}" if relay_host else group_id
+            body = preview if preview else f"Message in group {group_id}"
+            body += f"\n[{location}]"
+            return (f"NIP-29: {group_id}", body, "group")
 
     # --- Reactions (kind 7) ---
     if kind == 7:
@@ -880,16 +886,17 @@ async def listen_to_relay(relay_url, group_ids, pubkey_hex, ntfy_url, ntfy_token
                     await ws.send(json.dumps(["REQ", social_sub_id, social_filter]))
 
                     # --- Subscription 5: NIP-29 Group messages (kind 9 only) ---
-                    if group_ids:
-                        group_sub_id = f"grp-{pubkey_hex[:6]}-{suffix}"
-                        group_filter = {
-                            "#h": group_ids,
-                            "kinds": [9],
-                            "since": current_time - 60,
-                        }
-                        log.info("[%s] Relay %s -- sub %s: NIP-29 group messages (%d groups, kind 9)",
-                                 label, relay_url, group_sub_id, len(group_ids))
-                        await ws.send(json.dumps(["REQ", group_sub_id, group_filter]))
+                    # Always subscribe: group_ids for specific groups + "_" for relay-wide chat
+                    group_sub_id = f"grp-{pubkey_hex[:6]}-{suffix}"
+                    h_filter = list(set(group_ids + ["_"]))
+                    group_filter = {
+                        "#h": h_filter,
+                        "kinds": [9],
+                        "since": current_time - 60,
+                    }
+                    log.info("[%s] Relay %s -- sub %s: NIP-29 group messages (h=%s, kind 9)",
+                             label, relay_url, group_sub_id, h_filter)
+                    await ws.send(json.dumps(["REQ", group_sub_id, group_filter]))
 
                     msg_count = 0
                     last_stats_log = time.monotonic()
